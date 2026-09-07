@@ -118,7 +118,7 @@ export function encodeMcpHeaderValue(value: string): string {
  * import above) while `FetchLike` is declared against the global DOM types. They
  * are the same implementation at runtime on the Node versions we support.
  */
-const fetchWithMcpHeaders = (async (url: string | URL, init?: RequestInit) => {
+export const fetchWithMcpHeaders = (async (url: string | URL, init?: RequestInit) => {
   const mirrored = mcpHeadersFromBody(init?.body)
   const cookie = cookieHeaderFor(url)
 
@@ -137,8 +137,43 @@ const fetchWithMcpHeaders = (async (url: string | URL, init?: RequestInit) => {
 
   const response = await fetch(url, request)
   captureCookies(url, response)
-  return response
+  return response.ok ? response : asGlobalResponse(response)
 }) as unknown as FetchLike
+
+/** Statuses the `Response` constructor refuses a body for, per the fetch spec's null body statuses. */
+const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304])
+
+/**
+ * Rebuilds a response using the *global* `Response` class.
+ *
+ * The SDK renders OAuth failures through `parseErrorResponse`, which reads the body only when
+ * `input instanceof Response` holds against the global class. We hand the SDK undici's `fetch`
+ * (see the import above) and this package bundles its own undici, so the responses it gets back
+ * are a *different* `Response` class and that check never matches. Every OAuth error body was
+ * therefore stringified into the literal `[object Response]`, hiding the server's real
+ * `invalid_grant` or `invalid_client` behind noise (see issue #353). It is the same class-identity
+ * trap that once dropped every SDK-set header - see `mergeHeaders` below, and issue #157.
+ *
+ * Switching wholesale to the global `fetch` would be the worse fix: the bundled undici registers
+ * its dispatcher under `Symbol(undici.globalDispatcher.2)` while the global `fetch` reads `.1`, so
+ * `--connect-timeout`, `--body-timeout`, `--headers-timeout` and `--ipv4` would all quietly stop
+ * applying.
+ *
+ * Only failed responses are rebuilt. Successful ones carry the SSE stream the whole proxy runs on,
+ * and nothing reads an error body off those.
+ */
+function asGlobalResponse(response: Awaited<ReturnType<typeof fetch>>) {
+  const body = NULL_BODY_STATUSES.has(response.status) ? null : (response.body as ReadableStream | null)
+  const rebuilt = new globalThis.Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: [...response.headers] as [string, string][],
+  })
+  // `url` is a prototype getter the constructor cannot set, and it is worth keeping: it is what
+  // names the endpoint that failed in a debug log.
+  Object.defineProperty(rebuilt, 'url', { value: response.url })
+  return rebuilt
+}
 
 /**
  * The cookies the remote server has set on this process, if it has set any.

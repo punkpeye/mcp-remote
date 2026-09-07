@@ -11,6 +11,7 @@ import {
   mergeHeaders,
   parseSecondsOption,
   parseAuthorizeParams,
+  fetchWithMcpHeaders,
 } from './utils'
 import { getConfigDir } from './mcp-auth-config'
 import { Headers as UndiciHeaders } from 'undici'
@@ -18,6 +19,8 @@ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
+import { parseErrorResponse } from '@modelcontextprotocol/sdk/client/auth.js'
+import { InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { EventEmitter } from 'events'
 import { createServer, type ServerResponse } from 'node:http'
 
@@ -3342,5 +3345,59 @@ describe('Feature: Extra authorization parameters', () => {
 
     // Then nobody is signed out by the upgrade
     expect(after).toBe(before)
+  })
+})
+
+/**
+ * The SDK reads an OAuth error body only when the response satisfies `instanceof Response` against
+ * the *global* class. We hand it undici's `fetch` from a bundled copy, whose `Response` is a
+ * different class, so every OAuth failure used to be rendered as the literal `[object Response]` -
+ * hiding exactly the `invalid_grant` that made issue #353 so hard to place.
+ */
+describe('Feature: OAuth failures report what the server said', () => {
+  it('Scenario: A refused token exchange carries its OAuth error, not [object Response]', async () => {
+    // Given a token endpoint refusing an exchange the way RFC 6749 says to
+    const server = createServer((_req, res) => {
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: 'invalid_grant', error_description: 'code_verifier does not match' }))
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address() as net.AddressInfo
+
+    try {
+      // When the SDK renders that failure, from a response fetched the way it fetches them
+      const response = await fetchWithMcpHeaders(`http://127.0.0.1:${port}/token`, { method: 'POST' })
+      const error = await parseErrorResponse(response)
+
+      // Then it is the server's own error, not the shape of the object that carried it
+      expect(error).toBeInstanceOf(InvalidGrantError)
+      expect(error.message).toBe('code_verifier does not match')
+      expect(error.message).not.toContain('[object Response]')
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('Scenario: A failed response still reads as a response everywhere else', async () => {
+    // Given a server refusing with a status that carries no body
+    const server = createServer((_req, res) => {
+      res.writeHead(304, { 'x-served-by': 'node-1' })
+      res.end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address() as net.AddressInfo
+
+    try {
+      // When it comes back through our fetch
+      const response = await fetchWithMcpHeaders(`http://127.0.0.1:${port}/`, {})
+
+      // Then rebuilding it kept everything a caller reads off it - a status the `Response`
+      // constructor refuses a body for must not throw on the way through
+      expect(response.status).toBe(304)
+      expect(response.headers.get('x-served-by')).toBe('node-1')
+      expect(response.url).toBe(`http://127.0.0.1:${port}/`)
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
   })
 })
