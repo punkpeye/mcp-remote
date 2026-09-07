@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import * as mcpAuthConfig from './mcp-auth-config'
 import type { OAuthProviderOptions } from './types'
@@ -712,9 +713,11 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('should save the code verifier to a filename scoped to the authorization state', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
+      // The SDK asks for the state first, and that is what opens the flow the verifier belongs to
+      const state = provider.state()
       await provider.saveCodeVerifier('test-verifier')
 
-      expect(mockWriteTextFile).toHaveBeenCalledWith('test-hash', `code_verifier_${provider.state()}.txt`, 'test-verifier')
+      expect(mockWriteTextFile).toHaveBeenCalledWith('test-hash', `code_verifier_${state}.txt`, 'test-verifier')
       // Two processes for the same server must never target the same filename
       expect(mockWriteTextFile).not.toHaveBeenCalledWith('test-hash', 'code_verifier.txt', 'test-verifier')
     })
@@ -722,17 +725,19 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('should read the code verifier back from the same flow-scoped filename', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
+      const state = provider.state()
       await provider.codeVerifier()
 
-      expect(mockReadTextFile).toHaveBeenCalledWith('test-hash', `code_verifier_${provider.state()}.txt`, expect.any(String))
+      expect(mockReadTextFile).toHaveBeenCalledWith('test-hash', `code_verifier_${state}.txt`, expect.any(String))
     })
 
     it('should not leave its verifier behind once the flow has produced tokens', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
+      const state = provider.state()
       await provider.saveTokens({ access_token: 'token', token_type: 'Bearer' } as any)
 
-      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', `code_verifier_${provider.state()}.txt`)
+      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', `code_verifier_${state}.txt`)
       expect(vi.mocked(mcpAuthConfig.deleteStaleConfigFiles)).toHaveBeenCalledWith('test-hash', 'code_verifier_', expect.any(Number))
     })
 
@@ -753,27 +758,146 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('should ignore a state it could not have issued', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
+      const state = provider.state()
       // A crafted state would otherwise be interpolated straight into a config file path
       provider.useAuthorizationState('../../../../etc/passwd')
       await provider.codeVerifier()
 
-      expect(mockReadTextFile).toHaveBeenCalledWith('test-hash', `code_verifier_${provider.state()}.txt`, expect.any(String))
+      expect(mockReadTextFile).toHaveBeenCalledWith('test-hash', `code_verifier_${state}.txt`, expect.any(String))
     })
 
     it('should delete the flow-scoped verifier file when invalidating the verifier scope', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
+      const state = provider.state()
       await provider.invalidateCredentials('verifier')
 
-      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', `code_verifier_${provider.state()}.txt`)
+      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', `code_verifier_${state}.txt`)
     })
 
     it('should delete the flow-scoped verifier file when invalidating all credentials', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
+      const state = provider.state()
       await provider.invalidateCredentials('all')
 
-      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', `code_verifier_${provider.state()}.txt`)
+      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', `code_verifier_${state}.txt`)
+    })
+  })
+
+  /**
+   * A server that serves `initialize` unauthenticated but 401s the GET stream and `tools/call` -
+   * spec-legal pre-auth discovery - puts three transport arms into `auth()` at once. Each used to
+   * overwrite the previous one's verifier under a state fixed for the whole process, so the
+   * exchange presented one flow's verifier against another's challenge and failed `invalid_grant`
+   * every time, unrecoverably. See https://github.com/punkpeye/mcp-remote/issues/353.
+   */
+  describe('Feature: Concurrent demands for authorization', () => {
+    /** What the SDK puts in the authorization URL for a given verifier. */
+    const challengeFor = (verifier: string) => createHash('sha256').update(verifier).digest('base64url')
+
+    const authorizeUrl = (verifier: string) => {
+      const url = new URL('https://auth.example.com/authorize')
+      url.searchParams.set('code_challenge', challengeFor(verifier))
+      url.searchParams.set('code_challenge_method', 'S256')
+      return url
+    }
+
+    /** The verifier that actually reached disk, as the exchange would later read it back. */
+    const savedVerifier = () => {
+      const write = vi.mocked(mcpAuthConfig.writeTextFile).mock.calls.at(-1)
+      return write?.[2]
+    }
+
+    let openedUrls: string[]
+
+    beforeEach(async () => {
+      vi.mocked(mcpAuthConfig.writeTextFile).mockResolvedValue(undefined)
+      const { default: open } = await import('open')
+      vi.mocked(open).mockResolvedValue({} as any)
+      openedUrls = []
+      vi.mocked(open).mockImplementation(async (url: string) => {
+        openedUrls.push(url)
+        return {} as any
+      })
+      provider = new NodeOAuthClientProvider(defaultOptions)
+    })
+
+    it('sends the browser to the challenge whose verifier is the one on disk', async () => {
+      // Given two arms entering auth() at once, each with its own PKCE pair
+      const first = provider.state()
+      const second = provider.state()
+
+      // Then they are one sign-in, so the code that comes back names one verifier
+      expect(second).toBe(first)
+
+      await provider.saveCodeVerifier('verifier-from-first-arm')
+      await provider.saveCodeVerifier('verifier-from-second-arm')
+
+      // The first to land is kept: overwriting it is what broke the exchange
+      expect(savedVerifier()).toBe('verifier-from-first-arm')
+      expect(vi.mocked(mcpAuthConfig.writeTextFile)).toHaveBeenCalledTimes(1)
+
+      await provider.redirectToAuthorization(authorizeUrl('verifier-from-first-arm'))
+      await provider.redirectToAuthorization(authorizeUrl('verifier-from-second-arm'))
+
+      // One browser tab, and it carries the challenge the saved verifier redeems
+      expect(openedUrls).toHaveLength(1)
+      expect(new URL(openedUrls[0]).searchParams.get('code_challenge')).toBe(challengeFor(savedVerifier()!))
+    })
+
+    it('does not depend on which arm reaches the verifier first', async () => {
+      // Given the arms interleave the other way round - both take a state before either saves
+      provider.state()
+      provider.state()
+
+      await provider.saveCodeVerifier('verifier-from-second-arm')
+      await provider.saveCodeVerifier('verifier-from-first-arm')
+
+      // Then whichever arm saved first still owns the flow, and nothing overwrote it
+      expect(savedVerifier()).toBe('verifier-from-second-arm')
+      expect(vi.mocked(mcpAuthConfig.writeTextFile)).toHaveBeenCalledTimes(1)
+
+      // And the browser follows the verifier that was kept, not the arm that took a state first
+      await provider.redirectToAuthorization(authorizeUrl('verifier-from-first-arm'))
+      await provider.redirectToAuthorization(authorizeUrl('verifier-from-second-arm'))
+
+      expect(openedUrls).toHaveLength(1)
+      expect(new URL(openedUrls[0]).searchParams.get('code_challenge')).toBe(challengeFor(savedVerifier()!))
+    })
+
+    it('gives the next sign-in its own flow once this one has produced tokens', async () => {
+      // Given a flow that completed
+      const first = provider.state()
+      await provider.saveCodeVerifier('first-flow-verifier')
+      await provider.redirectToAuthorization(authorizeUrl('first-flow-verifier'))
+      await provider.saveTokens({ access_token: 'token', token_type: 'Bearer' } as any)
+
+      // When the server asks for a sign-in again
+      const second = provider.state()
+      await provider.saveCodeVerifier('second-flow-verifier')
+      await provider.redirectToAuthorization(authorizeUrl('second-flow-verifier'))
+
+      // Then it is a flow of its own, with its own state, verifier and browser tab - a finished
+      // sign-in must never suppress the next one
+      expect(second).not.toBe(first)
+      expect(savedVerifier()).toBe('second-flow-verifier')
+      expect(openedUrls).toHaveLength(2)
+      expect(new URL(openedUrls[1]).searchParams.get('code_challenge')).toBe(challengeFor('second-flow-verifier'))
+    })
+
+    it('redeems a concurrent flow with the verifier the browser was sent to', async () => {
+      // Given the arms raced and the callback came back naming their shared state
+      const state = provider.state()
+      provider.state()
+      await provider.saveCodeVerifier('verifier-from-first-arm')
+      await provider.saveCodeVerifier('verifier-from-second-arm')
+
+      provider.useAuthorizationState(state)
+      await provider.codeVerifier()
+
+      // Then the exchange reads the verifier that matches the challenge in the browser URL
+      expect(vi.mocked(mcpAuthConfig.readTextFile)).toHaveBeenCalledWith('test-hash', `code_verifier_${state}.txt`, expect.any(String))
     })
   })
 

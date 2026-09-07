@@ -24,7 +24,7 @@ import {
 import { openBrowser } from './open-browser'
 import { log, debugLog, buildRedirectUrl, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import { getAuthorizationServerUrl, type ProtectedResourceMetadata } from './protected-resource-metadata'
 import { authorizeWithDeviceCode, supportsDeviceAuthorization, DEVICE_CODE_GRANT_TYPE } from './device-authorization'
@@ -83,6 +83,32 @@ const UNCOORDINATED = ''
 
 /** How long a flow may still be in progress, and its verifier still needed. */
 const ABANDONED_FLOW_AGE_MS = 10 * 60 * 1000
+
+/**
+ * How long concurrent demands for authorization count as one sign-in rather than several.
+ *
+ * A server that answers some requests unauthenticated but 401s others - spec-legal, and what
+ * pre-auth tool discovery looks like - makes several transport arms enter `auth()` at once: the
+ * standalone GET stream, the fallback probe's stream, and the request that was actually refused.
+ *
+ * It only has to span how far apart those arms reach `state()`, which is the width of one connect
+ * burst - milliseconds once discovery is memoized, seconds at worst if each arm is still waiting
+ * on its own registration round trip. Deliberately kept well inside the default `--auth-timeout`
+ * of 30s, so an abandoned flow always stops holding the window before the sign-in it belongs to
+ * times out, rather than after. A finished flow closes it sooner still (see {@link saveTokens}).
+ */
+const CONCURRENT_FLOW_WINDOW_MS = 10_000
+
+/**
+ * The S256 challenge the SDK derives from a verifier.
+ *
+ * Recomputed here so a redirect can be matched back to the flow that produced it: the
+ * authorization URL carries the challenge, and that is the only thing linking it to one of
+ * several concurrent flows. See {@link NodeOAuthClientProvider.ownsPendingFlow}.
+ */
+function codeChallengeFor(codeVerifier: string): string {
+  return createHash('sha256').update(codeVerifier).digest('base64url')
+}
 
 /**
  * The token endpoint authentication methods this client can actually perform, best first.
@@ -168,6 +194,13 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private recentTokenWrites: number[] = []
   /** In-flight proactive refresh, so concurrent requests share one refresh_token use */
   private refreshInFlight: Promise<OAuthTokensWithExpiresAt | undefined> | null = null
+  /**
+   * The sign-in being started, so concurrent arms join it rather than race it.
+   *
+   * `challenge` is set by whichever arm saved its verifier first, and is what identifies that
+   * arm's redirect among the several that follow. See {@link CONCURRENT_FLOW_WINDOW_MS}.
+   */
+  private pendingFlow: { state: string; startedAt: number; challenge?: string } | null = null
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -236,7 +269,28 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     }
   }
 
+  /**
+   * The `state` this authorization will carry.
+   *
+   * Called once per flow, and the first provider method a new flow reaches, so it is where a
+   * flow is recognised as new. Concurrent arms are handed the state of the flow already being
+   * started: only one of them can be redeemed, and sharing the state means the code that comes
+   * back names the verifier that flow actually saved.
+   *
+   * A new flow supersedes any code received for an earlier one, so the state a callback last
+   * reported is dropped here - otherwise {@link flowState} would keep reading for a verifier this
+   * flow never wrote (and {@link saveTokens} has since deleted).
+   */
   state(): string {
+    const pending = this.pendingFlow
+    if (pending && Date.now() - pending.startedAt < CONCURRENT_FLOW_WINDOW_MS) {
+      debugLog('Joining the sign-in already being started', { state: pending.state })
+      return pending.state
+    }
+
+    this._state = randomUUID()
+    this.incomingState = undefined
+    this.pendingFlow = { state: this._state, startedAt: Date.now() }
     return this._state
   }
 
@@ -825,6 +879,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // The flow is over, and its verifier is named after a state nothing will use again
     await deleteConfigFile(this.serverUrlHash, this.codeVerifierFile(this.flowState))
     await deleteStaleConfigFiles(this.serverUrlHash, CODE_VERIFIER_PREFIX, ABANDONED_FLOW_AGE_MS)
+
+    // Closes the window early, so the next 401 opens a browser instead of joining a flow that has
+    // already finished
+    this.pendingFlow = null
   }
 
   /**
@@ -835,6 +893,16 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // A refused refresh sends the SDK down the full authorization path, so without this the brake
     // would turn an exchange loop into a browser-tab loop - the same storm, more visible.
     if (this.inTokenStorm()) throw this.tokenStormError()
+
+    // Every concurrent arm arrives here with its own challenge, but only the one whose verifier
+    // was kept can be redeemed. Sending the user to any of the others produces a code nothing can
+    // exchange - and a browser tab per arm. The rest simply fail as ordinary 401s, and retry once
+    // this flow has put tokens on disk.
+    if (!this.ownsPendingFlow(authorizationUrl)) {
+      log('A sign-in for this server is already under way; not starting another')
+      debugLog('Suppressed a concurrent authorization redirect', { state: this.pendingFlow?.state })
+      return
+    }
 
     // The device grant needs no browser here and no URL to send one to, so the SDK's whole
     // redirect is replaced rather than followed. It returns once tokens are on disk, which is
@@ -1007,11 +1075,24 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * The filename is scoped to this flow's authorization state rather than to the process, so a
    * code can still be redeemed by an instance that took the callback port over from the one that
    * started the flow. See https://github.com/geelen/mcp-remote/issues/235.
+   *
+   * Concurrent arms each generate their own PKCE pair, but only one challenge can be the one the
+   * browser is sent to, and only the verifier matching it can be redeemed. The first to land wins
+   * and later ones are dropped: overwriting meant the exchange presented one flow's verifier
+   * against another's challenge, which every authorization server correctly rejects as
+   * `invalid_grant` (see https://github.com/punkpeye/mcp-remote/issues/353).
    * @param codeVerifier The code verifier to save
    */
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    const flow = this.pendingFlow
+    if (flow?.challenge !== undefined) {
+      debugLog('Keeping the code verifier already saved for this sign-in', { state: flow.state })
+      return
+    }
+
     debugLog('Saving code verifier')
-    await writeTextFile(this.serverUrlHash, this.codeVerifierFile(this._state), codeVerifier)
+    await writeTextFile(this.serverUrlHash, this.codeVerifierFile(flow?.state ?? this._state), codeVerifier)
+    if (flow) flow.challenge = codeChallengeFor(codeVerifier)
   }
 
   /**
@@ -1031,6 +1112,20 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   /** The flow this instance is redeeming for: another instance's when a code names it. */
   private get flowState(): string {
     return this.incomingState ?? this._state
+  }
+
+  /**
+   * Whether this redirect belongs to the flow whose verifier is the one on disk.
+   *
+   * The challenge in the authorization URL is the only thing tying a redirect back to the
+   * verifier that produced it, since the SDK hands neither call a flow of its own to name.
+   * Unrecognised flows are allowed through: suppressing a sign-in that turns out to be the only
+   * one costs the user their connection, while an extra tab merely annoys.
+   */
+  private ownsPendingFlow(authorizationUrl: URL): boolean {
+    const challenge = this.pendingFlow?.challenge
+    if (challenge === undefined) return true
+    return authorizationUrl.searchParams.get('code_challenge') === challenge
   }
 
   private codeVerifierFile(state: string): string {
@@ -1064,6 +1159,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         ])
         this._clientInfo = undefined
         this.clientRegistrationSource = undefined
+        this.pendingFlow = null
         debugLog('All credentials invalidated')
         break
 
@@ -1081,6 +1177,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
       case 'verifier':
         await deleteConfigFile(this.serverUrlHash, this.codeVerifierFile(this.flowState))
+        this.pendingFlow = null
         debugLog('Code verifier invalidated')
         break
 
