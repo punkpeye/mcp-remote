@@ -327,6 +327,20 @@ const MESSAGE_BLOCKED = Symbol('MessageBlocked')
 /** How long the client's first requests wait on `notifications/initialized` before going anyway. */
 const LIFECYCLE_BARRIER_TIMEOUT_MS = 10_000
 
+/**
+ * How long to wait for the remote server to answer the client's `initialize` before giving up.
+ *
+ * A streaming response can open successfully and then never deliver the message it promised -
+ * `send()` resolves once the response starts, not once it answers, because the SDK reads the SSE
+ * body unawaited. Nothing above notices that on its own, so without this a server that opens the
+ * stream and never writes to it leaves the client waiting forever with no error on either side (see
+ * https://github.com/punkpeye/mcp-remote/issues/354).
+ *
+ * Scoped to `initialize` only: it is the one request never expected to run long, so it is the one
+ * request safe to bound without risking a slow `tools/call` that is still legitimately in progress.
+ */
+const INITIALIZE_TIMEOUT_MS = 30_000
+
 /** A timer that never keeps the process alive on its own. */
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -837,6 +851,7 @@ export function mcpProxy({
 
     try {
       await transportToServer.send(message)
+      if (message.method === 'initialize') scheduleInitializeTimeout(message)
       return
     } catch (error) {
       if (awaitsAnswer) pendingRequests.delete(message.id!)
@@ -893,6 +908,22 @@ export function mcpProxy({
         replyWithError(message, retryError as Error)
       }
     }
+  }
+
+  /**
+   * Fails the client's `initialize` if the remote server accepted it but never answered.
+   *
+   * A no-op once the real response arrives: `transportToServer.onmessage` removes the id from
+   * `pendingRequests` on delivery, which is what this checks before doing anything.
+   */
+  function scheduleInitializeTimeout(message: Message) {
+    setTimeout(() => {
+      if (!pendingRequests.has(message.id)) return
+      pendingRequests.delete(message.id)
+      const seconds = INITIALIZE_TIMEOUT_MS / 1000
+      log(`Remote server did not answer 'initialize' within ${seconds}s`)
+      replyWithError(message, new Error(`timed out after ${seconds}s waiting for the remote server to answer 'initialize'`))
+    }, INITIALIZE_TIMEOUT_MS).unref?.()
   }
 
   /**

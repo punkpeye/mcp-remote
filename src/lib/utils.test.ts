@@ -3258,6 +3258,74 @@ describe('Feature: Keeping an idle connection alive', () => {
   })
 })
 
+describe('Feature: Timing out an unanswered initialize', () => {
+  const mockTransport = () =>
+    ({
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    }) as unknown as Transport
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('Scenario: A server that opens a response and never answers is reported, not left hanging', async () => {
+    // Given a remote transport whose send() resolves (the stream opened) without ever calling onmessage
+    const transportToClient = mockTransport()
+    const transportToServer = mockTransport()
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [] })
+
+    // When the client initializes and the remote server never answers
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'initialize', id: 'init-1', params: {} } as any)
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // Then the client is given an error for that request instead of waiting forever
+    expect(transportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'init-1', error: expect.objectContaining({ code: -32001 }) }),
+    )
+  })
+
+  it('Scenario: A late answer within the window cancels the timeout', async () => {
+    // Given a proxy waiting on the client's initialize
+    const transportToClient = mockTransport()
+    const transportToServer = mockTransport()
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [] })
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'initialize', id: 'init-1', params: {} } as any)
+
+    // When the server answers just before the deadline
+    await vi.advanceTimersByTimeAsync(29_000)
+    transportToServer.onmessage?.({ jsonrpc: '2.0', id: 'init-1', result: { protocolVersion: '2025-11-25' } } as any)
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // Then the client sees the real answer, and only that one answer
+    const answers = (transportToClient.send as any).mock.calls.filter(([m]: any[]) => m.id === 'init-1')
+    expect(answers).toHaveLength(1)
+    expect(answers[0][0]).toMatchObject({ result: { protocolVersion: '2025-11-25' } })
+  })
+
+  it('Scenario: A slow tools/call is left alone', async () => {
+    // Given a proxy waiting on a request that is not initialize
+    const transportToClient = mockTransport()
+    const transportToServer = mockTransport()
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [] })
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'slow-tool' } } as any)
+
+    // When far more than the initialize window passes with no answer
+    await vi.advanceTimersByTimeAsync(5 * 60_000)
+
+    // Then nothing is reported - only initialize is bounded, so a legitimately long tool call is untouched
+    expect(transportToClient.send).not.toHaveBeenCalled()
+  })
+})
+
 describe('Feature: Keep-alive command line flags', () => {
   it('Scenario: Off unless asked for', async () => {
     const result = await parseCommandLineArgs(['https://example.com/mcp'], 'usage')
