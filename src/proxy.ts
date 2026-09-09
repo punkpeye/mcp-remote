@@ -86,6 +86,7 @@ async function runProxy(
   // Create the OAuth client provider with discovered server info
   const authProvider = new NodeOAuthClientProvider({
     serverUrl: discoveryResult.authorizationServerUrl,
+    resourceServerUrl: serverUrl,
     callbackPath,
     callbackPort,
     host,

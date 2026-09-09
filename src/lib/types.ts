@@ -9,6 +9,8 @@ import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 export interface OAuthProviderOptions {
   /** Server URL to connect to */
   serverUrl: string
+  /** The actual MCP server URL, for the RFC 8707 resource indicator. Defaults to `serverUrl`, which is the authorization server once discovery has run. */
+  resourceServerUrl?: string
   /** Port for the OAuth callback server */
   callbackPort: number
   /** Desired hostname for the OAuth callback server */

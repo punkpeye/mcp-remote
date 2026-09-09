@@ -454,6 +454,26 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(mockWriteJsonFile).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ access_token: 'at' }))
     })
 
+    it('sends the MCP server, not the authorization server, as the device grant resource', async () => {
+      // Given an authorization server on a different origin than the MCP server
+      mockReadJsonFile.mockResolvedValue({ client_id: 'c1', redirect_uris: ['http://localhost:8080/oauth/callback'] })
+      vi.mocked(authorizeWithDeviceCode).mockResolvedValue({ access_token: 'at', token_type: 'Bearer', expires_in: 3600 } as any)
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        useDeviceCode: true,
+        authorizationServerMetadata: deviceMetadata,
+        serverUrl: 'https://auth.example.com',
+        resourceServerUrl: 'https://mcp.example.com/mcp',
+        protectedResourceMetadata: { resource: 'https://mcp.example.com/mcp' } as any,
+      })
+
+      // selectResourceURL would otherwise compare the PRM resource against the authorization
+      // server URL and throw, same as the proactive refresh path
+      await provider.redirectToAuthorization(new URL('https://auth.example.com/authorize?client_id=c1'))
+
+      expect(authorizeWithDeviceCode).toHaveBeenCalledWith(expect.objectContaining({ resource: new URL('https://mcp.example.com/mcp') }))
+    })
+
     it('refuses rather than silently opening a browser the machine may not have', async () => {
       // Given a server that does not offer the grant at all
       mockReadJsonFile.mockResolvedValue({ client_id: 'c1', redirect_uris: [] })
@@ -1227,6 +1247,26 @@ describe('NodeOAuthClientProvider - proactive token refresh', () => {
     // a server that answers expiry with 400 or 403 never reaches the SDK's 401 path
     expect(mockRefresh).toHaveBeenCalledTimes(1)
     expect(mockRefresh.mock.calls[0][1].refreshToken).toBe('r1')
+    expect(result?.access_token).toBe('fresh-token')
+  })
+
+  it('Scenario: proactive refresh works when the authorization server is on a different origin than the MCP server', async () => {
+    withStoredTokens(storedTokens({ expires_at: Date.now() - 1000 }))
+    mockRefresh.mockResolvedValue({ access_token: 'fresh-token', refresh_token: 'r2', token_type: 'Bearer', expires_in: 3600 })
+    const provider = new NodeOAuthClientProvider({
+      ...options,
+      serverUrl: 'https://auth.example.com/',
+      resourceServerUrl: 'https://mcp.example.com/mcp',
+      protectedResourceMetadata: { resource: 'https://mcp.example.com/mcp' } as any,
+    })
+
+    const result = await provider.tokens()
+
+    // selectResourceURL compares the PRM resource against options.serverUrl, which is the
+    // authorization server here - without resourceServerUrl that mismatches and throws, so
+    // this used to fall back to the stale token on every refresh
+    expect(mockRefresh).toHaveBeenCalledTimes(1)
+    expect(mockRefresh.mock.calls[0][1].resource?.toString()).toBe('https://mcp.example.com/mcp')
     expect(result?.access_token).toBe('fresh-token')
   })
 

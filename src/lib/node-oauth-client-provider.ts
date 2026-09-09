@@ -253,6 +253,15 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     return buildRedirectUrl(this.options.host, this.options.callbackPort, this.callbackPath)
   }
 
+  /**
+   * The MCP server URL, for the RFC 8707 resource indicator. `options.serverUrl` holds the
+   * authorization server URL by the time it reaches this class (see proxy.ts/client.ts), which
+   * only coincides with the resource server when the two share an origin.
+   */
+  private get resourceServerUrl(): string {
+    return this.options.resourceServerUrl ?? this.options.serverUrl
+  }
+
   get clientMetadata() {
     const effectiveScope = this.getEffectiveScope()
     return {
@@ -764,7 +773,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       const authorizationServerUrl =
         (this.protectedResourceMetadata ? getAuthorizationServerUrl(this.protectedResourceMetadata) : undefined) ??
         new URL('/', this.options.serverUrl).toString()
-      const resource = await selectResourceURL(new URL(this.options.serverUrl), this, this.protectedResourceMetadata)
+      const resource = await selectResourceURL(new URL(this.resourceServerUrl), this, this.protectedResourceMetadata)
 
       debugLog('Refreshing access token before it expires', { authorizationServerUrl, resource: resource?.toString() })
 
@@ -970,7 +979,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * would put on an authorization code flow so the two cannot disagree about what the token is for.
    */
   private async deviceAuthorizationResource(): Promise<URL | undefined> {
-    return selectResourceURL(new URL(this.options.serverUrl), this, this.protectedResourceMetadata)
+    return selectResourceURL(new URL(this.resourceServerUrl), this, this.protectedResourceMetadata)
   }
 
   private async preflightCachedDynamicClientRegistration(authorizationUrl: URL): Promise<void> {
