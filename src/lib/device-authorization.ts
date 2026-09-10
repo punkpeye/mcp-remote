@@ -196,7 +196,7 @@ async function pollForTokens(
  * The SDK picks the client authentication method but does not export applying it, so this mirrors
  * `applyClientAuthentication` from `@modelcontextprotocol/sdk/client/auth.js` for our own requests.
  */
-function applyClientAuthentication(
+export function applyClientAuthentication(
   method: string,
   clientInformation: OAuthClientInformationMixed,
   headers: Headers,

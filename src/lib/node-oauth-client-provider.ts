@@ -1,5 +1,10 @@
 import { z } from 'zod'
-import { OAuthClientProvider, refreshAuthorization, selectResourceURL } from '@modelcontextprotocol/sdk/client/auth.js'
+import {
+  OAuthClientProvider,
+  refreshAuthorization,
+  selectClientAuthMethod,
+  selectResourceURL,
+} from '@modelcontextprotocol/sdk/client/auth.js'
 import {
   OAuthClientInformation,
   OAuthClientInformationFull,
@@ -27,7 +32,12 @@ import { sanitizeUrl } from 'strict-url-sanitise'
 import { createHash, randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import { getAuthorizationServerUrl, type ProtectedResourceMetadata } from './protected-resource-metadata'
-import { authorizeWithDeviceCode, supportsDeviceAuthorization, DEVICE_CODE_GRANT_TYPE } from './device-authorization'
+import {
+  applyClientAuthentication,
+  authorizeWithDeviceCode,
+  supportsDeviceAuthorization,
+  DEVICE_CODE_GRANT_TYPE,
+} from './device-authorization'
 
 /**
  * The OAuth token response only carries the relative `expires_in`, which is
@@ -430,6 +440,34 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   }
 
   /**
+   * Client authentication for every token request the SDK or this provider sends (the SDK's
+   * `executeTokenRequest`). Once a provider supplies this hook the SDK skips its own client
+   * authentication, so the hook reproduces that first, then adds the one parameter the SDK
+   * leaves out: `scope` on a `refresh_token` grant.
+   *
+   * RFC 6749 section 6 makes `scope` optional on refresh and the SDK omits it. Microsoft Entra ID
+   * reads a scopeless refresh from an app whose client id is also the resource as "requesting a
+   * token for itself" and answers `AADSTS90009`, so the session dies at every access-token expiry
+   * (modelcontextprotocol/typescript-sdk#2718, anthropics/claude-ai-mcp#840). Repeating the scope
+   * this client authorized with turns that 400 into a 200. It is a subset of the original grant,
+   * so every other server accepts it too. Authorization-code exchanges are left exactly as they were.
+   *
+   * An arrow property rather than a method: the SDK passes `provider.addClientAuthentication`
+   * around unbound (see its `auth()`), so `this` has to travel with it.
+   */
+  addClientAuthentication: NonNullable<OAuthClientProvider['addClientAuthentication']> = async (headers, params, _url, metadata) => {
+    const clientInformation = await this.clientInformation()
+    if (clientInformation) {
+      const authMethod = selectClientAuthMethod(clientInformation, metadata?.token_endpoint_auth_methods_supported ?? [])
+      applyClientAuthentication(authMethod, clientInformation, headers, params)
+    }
+    if (params.get('grant_type') === 'refresh_token' && !params.has('scope')) {
+      params.set('scope', this.getEffectiveScope())
+      debugLog('Added the requested scope to the refresh_token grant', { scope: params.get('scope') })
+    }
+  }
+
+  /**
    * Gets the client information if it exists
    * @returns The client information or undefined
    */
@@ -792,6 +830,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         clientInformation,
         refreshToken,
         resource,
+        addClientAuthentication: this.addClientAuthentication,
       })
 
       // Goes through saveTokens so the new expiry is persisted the same way

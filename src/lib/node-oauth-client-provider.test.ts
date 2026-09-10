@@ -1528,3 +1528,97 @@ describe('NodeOAuthClientProvider - Extra authorization parameters', () => {
     expect([...authUrl.searchParams.keys()].sort()).toEqual(['response_type', 'scope'])
   })
 })
+
+describe('NodeOAuthClientProvider - scope on refresh_token grants (Entra AADSTS90009)', () => {
+  const options: OAuthProviderOptions = {
+    serverUrl: 'https://example.com/mcp',
+    callbackPort: 8080,
+    host: 'localhost',
+    serverUrlHash: 'test-hash',
+  }
+
+  let mockReadJsonFile: any
+  let mockRefresh: any
+
+  const withClient = (client: Record<string, unknown>, tokens?: Record<string, unknown>) =>
+    mockReadJsonFile.mockImplementation(async (_hash: string, file: string) => (file === 'client_info.json' ? client : tokens))
+
+  const tokenRequest = (grantType: string, extra: Record<string, string> = {}) => new URLSearchParams({ grant_type: grantType, ...extra })
+
+  beforeEach(() => {
+    mockReadJsonFile = vi.mocked(mcpAuthConfig.readJsonFile)
+    mockRefresh = vi.mocked(refreshAuthorization)
+    vi.mocked(mcpAuthConfig.writeJsonFile).mockResolvedValue(undefined)
+    vi.mocked(mcpAuthConfig.deleteConfigFile).mockResolvedValue(undefined)
+    vi.mocked(mcpAuthConfig.acquireConfigLease).mockResolvedValue('lease-1')
+    vi.mocked(mcpAuthConfig.releaseConfigLease).mockResolvedValue(undefined)
+    withClient({ client_id: 'c1', redirect_uris: [] })
+  })
+
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('Scenario: a refresh_token grant carries client_id and the scope this client authorized with', async () => {
+    const provider = new NodeOAuthClientProvider({ ...options, staticOAuthClientMetadata: { scope: 'openid api://app/read' } as any })
+    const headers = new Headers()
+    const params = tokenRequest('refresh_token', { refresh_token: 'r1' })
+
+    await provider.addClientAuthentication(headers, params, 'https://as.example.com/token', {
+      token_endpoint_auth_methods_supported: ['none'],
+    } as any)
+
+    // The SDK skips its own client authentication once a hook exists, so the hook must supply it
+    expect(params.get('client_id')).toBe('c1')
+    // The parameter the SDK omits, and the one Entra needs when the client id is also the resource id
+    expect(params.get('scope')).toBe('openid api://app/read')
+  })
+
+  it('Scenario: an authorization_code exchange is left without a scope', async () => {
+    const provider = new NodeOAuthClientProvider({ ...options, staticOAuthClientMetadata: { scope: 'openid api://app/read' } as any })
+    const params = tokenRequest('authorization_code', { code: 'abc' })
+
+    await provider.addClientAuthentication(new Headers(), params, 'https://as.example.com/token', undefined)
+
+    expect(params.get('client_id')).toBe('c1')
+    expect(params.has('scope')).toBe(false)
+  })
+
+  it('Scenario: a scope the caller already set is kept', async () => {
+    const provider = new NodeOAuthClientProvider({ ...options, staticOAuthClientMetadata: { scope: 'openid api://app/read' } as any })
+    const params = tokenRequest('refresh_token', { refresh_token: 'r1', scope: 'api://app/read' })
+
+    await provider.addClientAuthentication(new Headers(), params, 'https://as.example.com/token', undefined)
+
+    expect(params.get('scope')).toBe('api://app/read')
+  })
+
+  it('Scenario: a confidential client keeps client_secret_basic on the header, not in the body', async () => {
+    withClient({ client_id: 'c1', client_secret: 's1', redirect_uris: [] })
+    const provider = new NodeOAuthClientProvider(options)
+    const headers = new Headers()
+    const params = tokenRequest('refresh_token', { refresh_token: 'r1' })
+
+    await provider.addClientAuthentication(headers, params, 'https://as.example.com/token', {
+      token_endpoint_auth_methods_supported: ['client_secret_basic'],
+    } as any)
+
+    expect(headers.get('Authorization')).toBe(`Basic ${Buffer.from('c1:s1').toString('base64')}`)
+    expect(params.has('client_id')).toBe(false)
+    expect(params.has('client_secret')).toBe(false)
+  })
+
+  it('Scenario: the proactive refresh hands the SDK this hook', async () => {
+    withClient(
+      { client_id: 'c1', redirect_uris: [] },
+      { access_token: 'stale', refresh_token: 'r1', token_type: 'Bearer', expires_in: 3600, expires_at: Date.now() - 1000 },
+    )
+    mockRefresh.mockResolvedValue({ access_token: 'fresh', refresh_token: 'r2', token_type: 'Bearer', expires_in: 3600 })
+    const provider = new NodeOAuthClientProvider(options)
+
+    await provider.tokens()
+
+    expect(mockRefresh).toHaveBeenCalledTimes(1)
+    expect(mockRefresh.mock.calls[0][1].addClientAuthentication).toBe(provider.addClientAuthentication)
+  })
+})
