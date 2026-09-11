@@ -449,8 +449,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * reads a scopeless refresh from an app whose client id is also the resource as "requesting a
    * token for itself" and answers `AADSTS90009`, so the session dies at every access-token expiry
    * (modelcontextprotocol/typescript-sdk#2718, anthropics/claude-ai-mcp#840). Repeating the scope
-   * this client authorized with turns that 400 into a 200. It is a subset of the original grant,
-   * so every other server accepts it too. Authorization-code exchanges are left exactly as they were.
+   * the grant carries turns that 400 into a 200, and names nothing the original grant did not, so
+   * every other server accepts it too. Authorization-code exchanges are left exactly as they were.
    *
    * An arrow property rather than a method: the SDK passes `provider.addClientAuthentication`
    * around unbound (see its `auth()`), so `this` has to travel with it.
@@ -462,9 +462,27 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       applyClientAuthentication(authMethod, clientInformation, headers, params)
     }
     if (params.get('grant_type') === 'refresh_token' && !params.has('scope')) {
-      params.set('scope', this.getEffectiveScope())
-      debugLog('Added the requested scope to the refresh_token grant', { scope: params.get('scope') })
+      const scope = await this.scopeToRepeatOnRefresh()
+      // A server that advertises `scopes_supported: []` is asking for no scope at all, and `scope=`
+      // is malformed rather than empty, so the parameter stays off the request entirely.
+      if (scope) {
+        params.set('scope', scope)
+        debugLog('Added the requested scope to the refresh_token grant', { scope })
+      }
     }
+  }
+
+  /**
+   * The scope to repeat on a refresh: what the authorization server actually granted, when it said
+   * so in the token response, and otherwise what this client asked for.
+   *
+   * RFC 6749 section 6 forbids a refresh from naming a scope the resource owner never granted, so
+   * echoing the request back at a server that downscoped the authorization earns `invalid_scope` -
+   * the refresh this exists to fix, broken a different way. The grant is the safe thing to repeat.
+   */
+  private async scopeToRepeatOnRefresh(): Promise<string> {
+    const stored = await readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema)
+    return stored?.scope ?? this.getEffectiveScope()
   }
 
   /**

@@ -1593,6 +1593,33 @@ describe('NodeOAuthClientProvider - scope on refresh_token grants (Entra AADSTS9
     expect(params.get('scope')).toBe('api://app/read')
   })
 
+  it('Scenario: the scope the server granted is repeated, not the wider one that was asked for', async () => {
+    withClient({ client_id: 'c1', redirect_uris: [] }, { access_token: 'a1', token_type: 'Bearer', scope: 'api://app/read' })
+    const provider = new NodeOAuthClientProvider({
+      ...options,
+      staticOAuthClientMetadata: { scope: 'openid api://app/read api://app/write' } as any,
+    })
+    const params = tokenRequest('refresh_token', { refresh_token: 'r1' })
+
+    await provider.addClientAuthentication(new Headers(), params, 'https://as.example.com/token', undefined)
+
+    // RFC 6749 section 6: a refresh may not name a scope the resource owner never granted
+    expect(params.get('scope')).toBe('api://app/read')
+  })
+
+  it('Scenario: a server that advertises no scopes gets a refresh with no scope parameter at all', async () => {
+    const provider = new NodeOAuthClientProvider({
+      ...options,
+      protectedResourceMetadata: { resource: 'https://example.com', scopes_supported: [] } as any,
+    })
+    const params = tokenRequest('refresh_token', { refresh_token: 'r1' })
+
+    await provider.addClientAuthentication(new Headers(), params, 'https://as.example.com/token', undefined)
+
+    // `scope=` is malformed, not empty, and this is the same server the authorization omitted it for
+    expect(params.has('scope')).toBe(false)
+  })
+
   it('Scenario: a confidential client keeps client_secret_basic on the header, not in the body', async () => {
     withClient({ client_id: 'c1', client_secret: 's1', redirect_uris: [] })
     const provider = new NodeOAuthClientProvider(options)
