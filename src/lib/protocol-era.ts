@@ -1,6 +1,7 @@
 import { DiscoverResultSchema } from '@modelcontextprotocol/core'
 import {
   CLIENT_CAPABILITIES_META_KEY,
+  SUBSCRIPTION_ID_META_KEY,
   CLIENT_INFO_META_KEY,
   LATEST_PROTOCOL_VERSION,
   PROTOCOL_VERSION_META_KEY,
@@ -213,6 +214,18 @@ const DROPPED_NOTIFICATIONS = new Set(['notifications/initialized'])
 export const isDroppedInModernEra = (method: string): boolean => DROPPED_NOTIFICATIONS.has(method)
 
 /**
+ * Notifications the modern era sends that a 2025-era client has no idea what to do with.
+ *
+ * `notifications/subscriptions/acknowledged` confirms a stream this proxy opened on the client's
+ * behalf - it answers a question the client never asked, and forwarding it only invites the client's
+ * SDK to complain about a method it has never heard of. The change notifications that arrive on the
+ * same stream are a different matter: those are exactly what the client is waiting for.
+ */
+const MODERN_ONLY_NOTIFICATIONS = new Set(['notifications/subscriptions/acknowledged'])
+
+export const isModernOnlyNotification = (method: string): boolean => MODERN_ONLY_NOTIFICATIONS.has(method)
+
+/**
  * Renders a modern result in terms a 2025-era client understands.
  *
  * The modern era tags every result with a `resultType`, and adds one - `input_required` - that has
@@ -247,3 +260,101 @@ export function translateModernResult(result: any): { result: any } | { error: {
     error: { code: -32603, message: `The remote server returned a result of an unrecognised type: ${String(resultType)}` },
   }
 }
+
+/**
+ * The subscription a legacy client would never ask for, but behaves as though it had.
+ *
+ * A 2025-era client expects `notifications/tools/list_changed` and friends to simply arrive; the
+ * modern era only sends them down a stream the client opened with `subscriptions/listen`. Since the
+ * client will never open one, this proxy opens it on its behalf - asking for exactly the change
+ * notifications the server said it can send, and nothing else.
+ *
+ * @param capabilities What `server/discover` advertised
+ * @returns The filter to listen with, or undefined if the server announces no changes at all
+ */
+export function subscriptionFilterFor(capabilities: Record<string, unknown> | undefined) {
+  const tools = capabilities?.tools as { listChanged?: boolean } | undefined
+  const prompts = capabilities?.prompts as { listChanged?: boolean } | undefined
+  const resources = capabilities?.resources as { listChanged?: boolean } | undefined
+
+  const filter = {
+    ...(tools?.listChanged ? { toolsListChanged: true } : {}),
+    ...(prompts?.listChanged ? { promptsListChanged: true } : {}),
+    ...(resources?.listChanged ? { resourcesListChanged: true } : {}),
+  }
+
+  return Object.keys(filter).length > 0 ? filter : undefined
+}
+
+/** The `subscriptions/listen` request, written in the modern era like everything else. */
+export function subscriptionsListenRequest(
+  id: string,
+  identity: LegacyClientIdentity,
+  version: string,
+  notifications: Record<string, unknown>,
+) {
+  return stampModernMeta({ jsonrpc: '2.0' as const, id, method: 'subscriptions/listen', params: { notifications } }, identity, version)
+}
+
+/**
+ * Strips the correlation the modern era adds to a streamed notification.
+ *
+ * The notification itself is already in terms a 2025-era client knows - same method, same params -
+ * because only its delivery changed. What it carries that the client has no use for is the id of
+ * the subscription it arrived on, which would be the one part of the message that could not have
+ * come from a 2025 server.
+ */
+export function stripSubscriptionMeta(message: { params?: any }) {
+  const meta = message.params?._meta
+  if (!meta || !(SUBSCRIPTION_ID_META_KEY in meta)) return message
+
+  const { [SUBSCRIPTION_ID_META_KEY]: _subscriptionId, ...rest } = meta
+  const params = { ...message.params }
+  if (Object.keys(rest).length > 0) {
+    params._meta = rest
+  } else {
+    delete params._meta
+  }
+
+  return { ...message, params }
+}
+
+/**
+ * How many times a single request may come back asking for more input before this gives up.
+ *
+ * Matches the SDK's own driver. A server that keeps asking is either in a loop or negotiating
+ * something a proxy has no business mediating; either way the client is better told.
+ */
+export const MAX_INPUT_REQUIRED_ROUNDS = 10
+
+/** Whether this result is the modern era asking for more input rather than answering. */
+export const isInputRequiredResult = (result: any): boolean => result?.resultType === 'input_required'
+
+/**
+ * The params to retry a multi-round-trip request with.
+ *
+ * `requestState` is echoed back byte for byte: it is the server's own opaque handle on the exchange,
+ * and the spec has it treat anything that came back through a client as attacker-controlled, so
+ * touching it here could only ever break a server that checks its integrity.
+ */
+export function inputRequiredRetryParams(originalParams: any, responses: Record<string, unknown>, requestState: string | undefined) {
+  const hasResponses = Object.keys(responses).length > 0
+
+  return {
+    ...originalParams,
+    ...(hasResponses ? { inputResponses: responses } : {}),
+    ...(requestState !== undefined ? { requestState } : {}),
+  }
+}
+
+/**
+ * The 2025-era requests a server can embed in an `input_required` result.
+ *
+ * Each one is a server-initiated request in its own right, and a 2025 client already knows how to
+ * answer all three - that era simply had the server send them directly rather than embed them. So
+ * the bridge does not translate them at all: it unpacks them, asks the client, and packs the
+ * answers back.
+ */
+const FULFILLABLE_INPUT_METHODS = new Set(['sampling/createMessage', 'roots/list', 'elicitation/create'])
+
+export const canFulfilInputRequest = (method: string): boolean => FULFILLABLE_INPUT_METHODS.has(method)

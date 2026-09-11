@@ -11,11 +11,19 @@ import {
 } from '@modelcontextprotocol/client'
 import type { FetchLike, OAuthClientInformationFull, Transport } from '@modelcontextprotocol/client'
 import {
+  canFulfilInputRequest,
   discoverRequest,
+  inputRequiredRetryParams,
   isDroppedInModernEra,
+  isInputRequiredResult,
+  isModernOnlyNotification,
   localAnswerFor,
+  MAX_INPUT_REQUIRED_ROUNDS,
   readEraFromDiscoverResponse,
   stampModernMeta,
+  stripSubscriptionMeta,
+  subscriptionFilterFor,
+  subscriptionsListenRequest,
   synthesizeInitializeResult,
   translateModernResult,
   type EraVerdict,
@@ -366,6 +374,14 @@ const INITIALIZE_TIMEOUT_MS = 30_000
  */
 const DISCOVER_TIMEOUT_MS = 10_000
 
+/**
+ * How long a `subscriptions/listen` stream is allowed to stay open.
+ *
+ * It is not a request timeout: the request *is* the stream, and it resolves only when the stream
+ * ends. This is the outer bound on a session's worth of change notifications.
+ */
+const SUBSCRIPTION_LIFETIME_MS = 24 * 60 * 60 * 1000
+
 /** A timer that never keeps the process alive on its own. */
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -493,6 +509,16 @@ export function mcpProxy({
   let eraNegotiation: Promise<void> | null = null
   let discoverSeq = 0
   const pendingDiscover = new Map<string, (message: Message) => void>()
+  /** Requests this proxy issued to the remote on its own account, keyed by the id it minted. */
+  const pendingOwnRequests = new Map<string, (message: Message) => void>()
+  /** Requests this proxy put to the local client on the remote's behalf, awaiting its answer. */
+  const pendingClientRequests = new Map<string, (message: Message) => void>()
+  let ownRequestSeq = 0
+  /**
+   * Client requests still in flight against the remote, kept so a multi-round-trip exchange can be
+   * retried with the same params the client sent.
+   */
+  const modernOriginals = new Map<string | number, Message>()
   let reauthorizeInFlight: Promise<void> | null = null
   /** In-flight recovery from a reconnected stream. See `onStreamReconnect` below. */
   let sessionResumption: Promise<void> | null = null
@@ -555,6 +581,17 @@ export function mcpProxy({
   })
 
   transportToClient.onmessage = (_message) => {
+    const answeringId = (_message as any).id
+
+    // The client answering a question this proxy put to it on the remote's behalf. It is ours to
+    // consume: the remote never saw a request with this id, because this proxy minted it.
+    if (typeof answeringId === 'string' && pendingClientRequests.has(answeringId)) {
+      const settle = pendingClientRequests.get(answeringId)!
+      pendingClientRequests.delete(answeringId)
+      settle(_message as any)
+      return
+    }
+
     // TODO: fix types
     const message = messageTransformer.interceptRequest(_message as any)
 
@@ -608,12 +645,43 @@ export function mcpProxy({
       return
     }
 
+    // Confirmation of a stream this proxy opened for the client, which the client never asked for
+    if (era?.era === 'modern' && (_message as any).method && isModernOnlyNotification((_message as any).method)) {
+      debugLog('Consuming a notification that belongs to this proxy, not the client', { method: (_message as any).method })
+      return
+    }
+
     // The answer to our own era probe is ours to consume too - the client never asked for it
     if (typeof incomingId === 'string' && pendingDiscover.has(incomingId)) {
       const settle = pendingDiscover.get(incomingId)!
       pendingDiscover.delete(incomingId)
       settle(_message as any)
       return
+    }
+
+    // Likewise for anything else this proxy asked on its own account: the subscription it opened
+    // for the client, and each leg of a multi-round-trip retry
+    if (typeof incomingId === 'string' && pendingOwnRequests.has(incomingId)) {
+      const settle = pendingOwnRequests.get(incomingId)!
+      pendingOwnRequests.delete(incomingId)
+      settle(_message as any)
+      return
+    }
+
+    // A modern server asking for input rather than answering. The client is left waiting on the
+    // request it sent while the questions are put to it separately, and is answered once.
+    if (era?.era === 'modern' && incomingId !== undefined && incomingId !== null && isInputRequiredResult((_message as any).result)) {
+      const original = modernOriginals.get(incomingId)
+      if (original) {
+        modernOriginals.delete(incomingId)
+        pendingRequests.delete(incomingId)
+        log('[Remote→Local]', `${incomingId} (asking for more input)`)
+        driveInputRequired(original, (_message as any).result, era.version).catch((error: Error) => {
+          onServerError(error)
+          replyWithError(original, error)
+        })
+        return
+      }
     }
 
     // Responses to our own re-initialize handshake are ours to consume, not the client's
@@ -626,10 +694,14 @@ export function mcpProxy({
 
     if (incomingId !== undefined && incomingId !== null) {
       pendingRequests.delete(incomingId)
+      modernOriginals.delete(incomingId)
     }
 
     // TODO: fix types
-    const message = messageTransformer.interceptResponse(_message as any)
+    const message =
+      era?.era === 'modern'
+        ? stripSubscriptionMeta(messageTransformer.interceptResponse(_message as any))
+        : messageTransformer.interceptResponse(_message as any)
     log('[Remote→Local]', message.method || message.id)
 
     debugLog('Remote → Local message', {
@@ -815,6 +887,8 @@ export function mcpProxy({
       transportToClient
         .send({ jsonrpc: '2.0', id: initialize.id, result: synthesizeInitializeResult(era.discover, clientIdentity) })
         .catch(onClientError)
+
+      void openChangeSubscription(era.version, era.discover.capabilities)
       return
     }
 
@@ -833,6 +907,163 @@ export function mcpProxy({
 
     debugLog('Treating the remote server as legacy', { reason: era.reason })
     void sendToServer(initialize)
+  }
+
+  /**
+   * Sends a request this proxy is making on its own account, and waits for its answer.
+   *
+   * The id is minted here and recorded, so the answer is recognised on the way back and consumed
+   * rather than forwarded to a client that never asked the question.
+   *
+   * @param build Given the minted id, the message to send
+   * @param timeoutMs How long to wait before giving up on an answer
+   * @returns The response the remote sent
+   */
+  function askRemote(build: (id: string) => Message, timeoutMs: number): Promise<Message> {
+    const id = `mcp-remote-own-${++ownRequestSeq}`
+
+    return new Promise<Message>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingOwnRequests.delete(id)
+        reject(new Error('timed out waiting for the remote server to answer'))
+      }, timeoutMs)
+      timer.unref?.()
+
+      pendingOwnRequests.set(id, (message) => {
+        clearTimeout(timer)
+        resolve(message)
+      })
+
+      transportToServer.send(build(id)).catch((error) => {
+        clearTimeout(timer)
+        pendingOwnRequests.delete(id)
+        reject(error)
+      })
+    })
+  }
+
+  /**
+   * Puts a request to the local client on the remote server's behalf, and waits for its answer.
+   *
+   * Used for the input a modern server embeds in an `input_required` result: a 2025-era client
+   * already knows how to answer sampling, elicitation and roots - that era simply had the server
+   * ask directly - so the question is passed on unchanged and the answer collected.
+   */
+  function askClient(method: string, params: unknown, timeoutMs: number): Promise<Message> {
+    const id = `mcp-remote-input-${++ownRequestSeq}`
+
+    return new Promise<Message>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingClientRequests.delete(id)
+        reject(new Error(`the local client did not answer ${method}`))
+      }, timeoutMs)
+      timer.unref?.()
+
+      pendingClientRequests.set(id, (message) => {
+        clearTimeout(timer)
+        resolve(message)
+      })
+
+      transportToClient.send({ jsonrpc: '2.0', id, method, params } as Message).catch((error) => {
+        clearTimeout(timer)
+        pendingClientRequests.delete(id)
+        reject(error)
+      })
+    })
+  }
+
+  /**
+   * Opens the change-notification stream a 2025-era client would never open for itself.
+   *
+   * That era had `notifications/tools/list_changed` and friends simply arrive; the modern era sends
+   * them only down a `subscriptions/listen` stream the client asked for. A client that has never
+   * heard of subscriptions will not ask, so it would silently stop learning that anything changed -
+   * a failure with no error anywhere to explain it. This asks on its behalf, for exactly the
+   * notifications the server said it can send.
+   *
+   * Deliberately not awaited by anything: the request stays open for the life of the stream, and
+   * failing to open it costs the client change notifications, not its session.
+   */
+  async function openChangeSubscription(version: string, capabilities: Record<string, unknown> | undefined) {
+    const notifications = subscriptionFilterFor(capabilities)
+    if (!notifications) {
+      debugLog('The server advertises no change notifications, so nothing is subscribed to')
+      return
+    }
+
+    try {
+      debugLog('Subscribing to change notifications on the client behalf', { notifications })
+      // Resolves only when the stream ends, so the timeout is the life of the session rather than
+      // the life of a request
+      const response = await askRemote(
+        (id) => subscriptionsListenRequest(id, clientIdentity, version, notifications) as Message,
+        SUBSCRIPTION_LIFETIME_MS,
+      )
+      if (response.error) {
+        log(`The remote server refused the change-notification subscription: ${JSON.stringify(response.error)}`)
+      }
+    } catch (error) {
+      debugLog('The change-notification subscription ended', error)
+    }
+  }
+
+  /**
+   * Answers a modern server that asked for more input before it could finish.
+   *
+   * The 2026-07-28 era turned the server's mid-request questions - sampling, elicitation, roots -
+   * from requests it sends into requests it embeds in an `input_required` result, to be answered on
+   * a retry. A 2025-era client only understands the first shape, and has no idea it is being asked
+   * anything. So the embedded questions are unpacked and put to it as the ordinary server-initiated
+   * requests it does understand, and its answers are packed into the retry.
+   *
+   * The client is never told any of this happened: it is still waiting on the one request it sent,
+   * and that is what it is eventually answered with.
+   *
+   * @param original The request the client sent, which is what gets retried
+   * @param firstResult The `input_required` result that started the exchange
+   * @param version The revision being spoken to the remote server
+   */
+  async function driveInputRequired(original: Message, firstResult: any, version: string) {
+    let pending = firstResult
+
+    for (let round = 0; round < MAX_INPUT_REQUIRED_ROUNDS; round++) {
+      const requests: Record<string, { method: string; params?: unknown }> = pending.inputRequests ?? {}
+      const responses: Record<string, unknown> = {}
+
+      for (const [key, request] of Object.entries(requests)) {
+        if (!canFulfilInputRequest(request.method)) {
+          throw new Error(`the remote server asked for ${request.method}, which this proxy cannot put to a 2025-era client`)
+        }
+
+        const answer = await askClient(request.method, request.params, INITIALIZE_TIMEOUT_MS)
+        if (answer.error) {
+          throw new Error(`the local client refused ${request.method}: ${JSON.stringify(answer.error)}`)
+        }
+        responses[key] = answer.result
+      }
+
+      const retryParams = inputRequiredRetryParams(original.params, responses, pending.requestState)
+      const reply = await askRemote(
+        (id) => stampModernMeta({ ...original, id, params: retryParams }, clientIdentity, version) as Message,
+        INITIALIZE_TIMEOUT_MS,
+      )
+
+      if (reply.error) {
+        transportToClient.send({ jsonrpc: '2.0', id: original.id, error: reply.error } as Message).catch(onClientError)
+        return
+      }
+
+      if (!isInputRequiredResult(reply.result)) {
+        const translated = translateModernResult(reply.result)
+        const answer = 'error' in translated ? { error: translated.error } : { result: translated.result }
+        transportToClient.send({ jsonrpc: '2.0', id: original.id, ...answer } as Message).catch(onClientError)
+        return
+      }
+
+      pending = reply.result
+    }
+
+    throw new Error(`the remote server asked for more input ${MAX_INPUT_REQUIRED_ROUNDS} times without answering`)
   }
 
   let reinitInFlight: Promise<void> | null = null
@@ -1019,6 +1250,9 @@ export function mcpProxy({
     // Stamped here rather than in the transformer because the transformer runs the moment the
     // client's message arrives, which can be before the probe has said which era to speak.
     const outgoing = era?.era === 'modern' && awaitsAnswer ? stampModernMeta(message, clientIdentity, era.version) : message
+
+    // Kept so that a server answering `input_required` can be retried with what the client sent
+    if (era?.era === 'modern' && awaitsAnswer) modernOriginals.set(message.id!, message)
 
     try {
       await transportToServer.send(outgoing)

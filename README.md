@@ -381,16 +381,21 @@ npx mcp-remote https://example.remote/mcp --protocol auto
 It is off by default because every server in the wild today is a legacy one, and the probe is a round
 trip those connections do not need.
 
-**Not yet bridged.** Two parts of the modern era have no `2025-11-25` equivalent, and a session that
-needs them will not work through the bridge:
+The two modern surfaces with no `2025-11-25` equivalent are bridged as well:
 
-- Change notifications. The modern era replaces unsolicited `notifications/tools/list_changed` and
-  `resources/updated` with a `subscriptions/listen` stream, which is not yet translated back.
-- Multi-round-trip requests. A server that answers with `input_required` — asking for sampling,
-  elicitation or roots mid-request — is reported to the local client as an error, because a client
-  from before MRTR has nowhere to put the question.
+- **Change notifications.** The modern era only sends `notifications/tools/list_changed` and friends
+  down a `subscriptions/listen` stream the client opens. A 2025-era client never opens one, so
+  `mcp-remote` opens it on the client's behalf — asking for exactly the notifications the server said
+  it can send — and passes each one on in the shape that era expects.
+- **Multi-round-trip requests.** When a server answers with `input_required`, asking for sampling,
+  elicitation or roots mid-request, `mcp-remote` unpacks the embedded questions and puts them to the
+  client as the ordinary server-initiated requests it already understands, then retries the original
+  request with the answers and a byte-exact echo of the server's `requestState`. The client is never
+  told any of this happened: it is still waiting on the one request it sent, and that is what it is
+  answered with. Capped at 10 rounds.
 
-Tool listing and tool calls, which is what most remote servers expose, work.
+A question this proxy cannot put to a 2025-era client — anything outside sampling, elicitation and
+roots — is reported as an error rather than dropped.
 
 ### Static OAuth Client Metadata
 

@@ -3035,6 +3035,182 @@ describe('Feature: Bridging a legacy client to a 2026-07-28 server', () => {
   })
 })
 
+/**
+ * The two 2026-07-28 surfaces with no 2025 equivalent, bridged in terms the older client knows.
+ * See https://github.com/punkpeye/mcp-remote/issues/358.
+ */
+describe('Feature: Bridging the modern surfaces a 2025-era client has never heard of', () => {
+  const INITIALIZE = {
+    jsonrpc: '2.0' as const,
+    method: 'initialize',
+    id: 'init-1',
+    params: { protocolVersion: '2025-11-25', capabilities: { sampling: {} }, clientInfo: { name: 'host', version: '1.0.0' } },
+  }
+
+  const clientTransport = (sent: any[]) => {
+    const transport: any = {
+      send: vi.fn(async (message: any) => {
+        sent.push(message)
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    }
+    return transport
+  }
+
+  const serverTransport = (sent: any[], respond: (message: any) => any | undefined) => {
+    const transport: any = {
+      send: vi.fn(async (message: any) => {
+        sent.push(message)
+        const reply = respond(message)
+        if (reply) queueMicrotask(() => transport.onmessage?.(reply))
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      setProtocolVersion: vi.fn(),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    }
+    return transport
+  }
+
+  const discoverResult = (capabilities: any) => ({ supportedVersions: ['2026-07-28'], capabilities })
+
+  it('Scenario: Subscribe to change notifications the client will never ask for itself', async () => {
+    // Given a server that announces it can report tool and resource list changes
+    const serverSent: any[] = []
+    const transportToClient = clientTransport([])
+    const transportToServer = serverTransport(serverSent, (message: any) =>
+      message.method === 'server/discover'
+        ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: { listChanged: true }, resources: { listChanged: true } }) }
+        : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+
+    // Then a stream is opened on the client's behalf, asking for exactly those
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'subscriptions/listen')).toHaveLength(1))
+    const listen = serverSent.find((message) => message.method === 'subscriptions/listen')
+    expect(listen.params.notifications).toEqual({ toolsListChanged: true, resourcesListChanged: true })
+    expect(listen.params._meta['io.modelcontextprotocol/protocolVersion']).toBe('2026-07-28')
+  })
+
+  it('Scenario: Do not open a stream for a server that announces no changes', async () => {
+    const serverSent: any[] = []
+    const transportToClient = clientTransport([])
+    const transportToServer = serverTransport(serverSent, (message: any) =>
+      message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) } : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+
+    await vi.waitFor(() => expect(transportToServer.setProtocolVersion).toHaveBeenCalled())
+    expect(serverSent.filter((message) => message.method === 'subscriptions/listen')).toHaveLength(0)
+  })
+
+  it('Scenario: A streamed notification reaches the client without the subscription it rode in on', async () => {
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], (message: any) =>
+      message.method === 'server/discover'
+        ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: { listChanged: true } }) }
+        : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToServer.onmessage?.({
+      jsonrpc: '2.0',
+      method: 'notifications/tools/list_changed',
+      params: { _meta: { 'io.modelcontextprotocol/subscriptionId': 'sub-1' } },
+    })
+
+    // The method and params are already what a 2025 client expects; only the correlation is new
+    await vi.waitFor(() => expect(clientSent).toHaveLength(2))
+    expect(clientSent[1].method).toBe('notifications/tools/list_changed')
+    expect(clientSent[1].params).toEqual({})
+  })
+
+  it('Scenario: A mid-request question is put to the client as the request it does understand', async () => {
+    // Given a server that answers tools/call by asking for sampling first
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call') return undefined
+
+      // The retry carries the answer; the first attempt does not
+      if (message.params.inputResponses) {
+        return { jsonrpc: '2.0', id: message.id, result: { resultType: 'complete', content: [{ type: 'text', text: 'done' }] } }
+      }
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          resultType: 'input_required',
+          requestState: 'opaque-state',
+          inputRequests: { ask: { method: 'sampling/createMessage', params: { messages: [] } } },
+        },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'search' } } as any)
+
+    // Then the embedded question is put to the client as an ordinary server-initiated request
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.method === 'sampling/createMessage')).toHaveLength(1))
+    const question = clientSent.find((message) => message.method === 'sampling/createMessage')
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant', content: { type: 'text', text: 'hi' } } })
+
+    // And the retry carries the answer and echoes the server's opaque state back untouched
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'tools/call')).toHaveLength(2))
+    const retry = serverSent.filter((message) => message.method === 'tools/call')[1]
+    expect(retry.params.inputResponses.ask).toEqual({ role: 'assistant', content: { type: 'text', text: 'hi' } })
+    expect(retry.params.requestState).toBe('opaque-state')
+    expect(retry.params.name).toBe('search')
+
+    // And the client is answered once, on the request it actually sent
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'call-1')).toHaveLength(1))
+    expect(clientSent.find((message) => message.id === 'call-1').result).toEqual({ content: [{ type: 'text', text: 'done' }] })
+  })
+
+  it('Scenario: A question this proxy cannot put to a 2025-era client is reported, not dropped', async () => {
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call') return undefined
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'something/new', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'search' } } as any)
+
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'call-1')).toHaveLength(1))
+    expect(clientSent.find((message) => message.id === 'call-1').error.message).toContain('something/new')
+  })
+})
+
 describe('Feature: Merging headers for the SSE request', () => {
   it('Scenario: Keep the headers the SDK set, whichever Headers class built them', () => {
     // Given headers from the SDK, which builds them with the global class rather than undici's
