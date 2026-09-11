@@ -21,6 +21,7 @@ import {
   releaseConfigLease,
 } from './mcp-auth-config'
 import { openBrowser } from './open-browser'
+import { authorizeWithClientCredentials } from './client-credentials'
 import { log, debugLog, buildRedirectUrl, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
 import { createHash, randomUUID } from 'node:crypto'
@@ -81,6 +82,17 @@ const CODE_VERIFIER_PREFIX = 'code_verifier_'
  */
 const TOKEN_STORM_LIMIT = 20
 const TOKEN_STORM_WINDOW_MS = 30_000
+
+/**
+ * How many browser sign-ins may be started inside {@link TOKEN_STORM_WINDOW_MS} before this client
+ * stops asking for another.
+ *
+ * Counted separately from the token brake above, and for the case that one cannot see: a loop where
+ * the sign-in never completes writes no tokens at all, so nothing accumulates for that brake to
+ * catch, and the user watches tab after tab open instead (issue #352). Low, because a sign-in is a
+ * human action - even a handful in half a minute is already a loop, not a person.
+ */
+const AUTHORIZATION_STORM_LIMIT = 5
 
 /** Treat a token about to expire as expired, rather than sending one that will 401 in transit. */
 const TOKEN_EXPIRY_MARGIN_MS = 60_000
@@ -193,6 +205,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   clientMetadataUrl?: string
   private useIdToken: boolean
   private useDeviceCode: boolean
+  private useClientCredentials: boolean
   /** So a server that never issues an ID token is reported once, not on every outgoing request. */
   private warnedAboutMissingIdToken = false
   private authorizeResource: string | undefined
@@ -212,6 +225,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private wwwAuthenticateScope: string | undefined
   /** When tokens were last written, for spotting an exchange loop. See {@link TOKEN_STORM_LIMIT}. */
   private recentTokenWrites: number[] = []
+  /** When sign-ins were last started, for spotting a loop that never gets as far as a token. */
+  private recentAuthorizations: number[] = []
   /** In-flight proactive refresh, so concurrent requests share one refresh_token use */
   private refreshInFlight: Promise<OAuthTokensWithExpiresAt | undefined> | null = null
   /**
@@ -238,6 +253,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.clientMetadataUrl = options.clientMetadataUrl
     this.useIdToken = options.useIdToken ?? false
     this.useDeviceCode = options.useDeviceCode ?? false
+    this.useClientCredentials = options.useClientCredentials ?? false
     const trimmedAuthorizeResource = options.authorizeResource?.trim()
     this.authorizeResource = trimmedAuthorizeResource ? trimmedAuthorizeResource : undefined
     this.skipResourceParameter = options.skipResourceParameter ?? false
@@ -287,7 +303,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     return {
       redirect_uris: [this.redirectUrl],
       token_endpoint_auth_method: this.getTokenEndpointAuthMethod(),
-      grant_types: this.useDeviceCode ? [DEVICE_CODE_GRANT_TYPE, 'refresh_token'] : ['authorization_code', 'refresh_token'],
+      grant_types: this.grantTypes(),
       response_types: ['code'],
       client_name: this.clientName,
       client_uri: this.clientUri,
@@ -929,6 +945,29 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.recentTokenWrites.push(Date.now())
   }
 
+  /**
+   * Stops a reconnect loop from opening a browser tab per turn.
+   *
+   * The token brake cannot see this one: a loop that fails before any token is issued leaves
+   * {@link recentTokenWrites} empty, so the only thing that accumulates is tabs.
+   */
+  private guardAgainstAuthorizationStorm(): void {
+    const now = Date.now()
+    this.recentAuthorizations = this.recentAuthorizations.filter((at) => now - at < TOKEN_STORM_WINDOW_MS)
+
+    if (this.recentAuthorizations.length >= AUTHORIZATION_STORM_LIMIT) {
+      const seconds = TOKEN_STORM_WINDOW_MS / 1000
+      log(`Stopping: ${AUTHORIZATION_STORM_LIMIT} sign-ins were started in the last ${seconds}s and none of them completed.`)
+      debugLog('Authorization loop detected', { starts: this.recentAuthorizations.length, windowMs: TOKEN_STORM_WINDOW_MS })
+      throw new Error(
+        `Stopped after ${AUTHORIZATION_STORM_LIMIT} sign-ins in ${seconds}s, none of which completed. Opening another ` +
+          `browser tab would only repeat it - check that the server accepts the tokens this client is being issued.`,
+      )
+    }
+
+    this.recentAuthorizations.push(now)
+  }
+
   async saveTokens(tokens: OAuthTokens): Promise<void> {
     this.guardAgainstTokenStorm()
 
@@ -997,6 +1036,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
+    // Nobody is being asked for consent here, so there is no URL to send anyone to. Like the device
+    // grant above, the whole redirect is replaced: this returns once tokens are on disk, which is
+    // what the reconnect above this then finds.
+    if (this.useClientCredentials) {
+      await this.authorizeWithClientCredentials()
+      return
+    }
+
     // Optionally fetch metadata for debugging/informational purposes (non-blocking)
     this.getAuthorizationServerMetadata().catch(() => {
       // Ignore errors, metadata is optional
@@ -1010,6 +1057,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Redirecting to authorization URL', authorizationUrl.toString())
 
     await this.preflightCachedDynamicClientRegistration(authorizationUrl)
+
+    this.guardAgainstAuthorizationStorm()
 
     if (await openBrowser(sanitizeUrl(authorizationUrl.toString()))) {
       log('Browser opened automatically.')
@@ -1054,6 +1103,46 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * The RFC 8707 resource indicator to send with a device authorization, matching what the SDK
    * would put on an authorization code flow so the two cannot disagree about what the token is for.
    */
+  /**
+   * The grants to register for.
+   *
+   * `client_credentials` is listed alone: it has no user to come back as a refresh, and asking for
+   * `authorization_code` alongside it would register a redirect-based client this flow never uses.
+   */
+  private grantTypes(): string[] {
+    if (this.useClientCredentials) return ['client_credentials']
+    if (this.useDeviceCode) return [DEVICE_CODE_GRANT_TYPE, 'refresh_token']
+    return ['authorization_code', 'refresh_token']
+  }
+
+  /**
+   * Signs in as the software itself, and leaves the token where the next attempt will find it.
+   *
+   * Runs to completion here for the same reason the device grant does: nothing arrives at a
+   * callback port, so the only trace of a finished sign-in is the token on disk.
+   */
+  private async authorizeWithClientCredentials(): Promise<void> {
+    const metadata = await this.getAuthorizationServerMetadata()
+    if (!metadata) {
+      throw new Error('Could not discover the authorization server metadata, so there is no token endpoint to ask')
+    }
+
+    const clientInformation = await this.clientInformation()
+    if (!clientInformation) {
+      throw new Error('No OAuth client credentials were supplied; pass them with --static-oauth-client-info')
+    }
+
+    const scope = this.getEffectiveScope()
+    const tokens = await authorizeWithClientCredentials({
+      metadata,
+      clientInformation,
+      scope: scope || undefined,
+      resource: await this.deviceAuthorizationResource(),
+    })
+
+    await this.saveTokens(tokens)
+  }
+
   private async deviceAuthorizationResource(): Promise<URL | undefined> {
     return selectResourceURL(new URL(this.resourceServerUrl), this, this.protectedResourceMetadata)
   }

@@ -11,7 +11,8 @@ import { log, debugLog, setupOAuthCallbackServerWithLongPoll, MCP_REMOTE_ID_PATH
 const FOLLOWER_PATIENCE_MS = 3 * 60_000
 
 export type AuthCoordinator = {
-  initializeAuth: () => Promise<{
+  /** @param options `forceRefresh` discards a cached verdict this instance has already acted on */
+  initializeAuth: (options?: { forceRefresh?: boolean }) => Promise<{
     server: Server
     waitForAuthCode: () => Promise<AuthCodeResult>
     skipBrowserAuth: boolean
@@ -48,7 +49,14 @@ export function createLazyAuthCoordinator(
   }> | null = null
 
   return {
-    initializeAuth: async () => {
+    initializeAuth: async (options) => {
+      if (authState && options?.forceRefresh) {
+        // The cached verdict has been acted on and did not hold. Keeping it would keep answering
+        // "wait for the sibling" to an instance that has already waited (issue #352).
+        debugLog('Discarding the cached auth coordination verdict and looking again')
+        authState = null
+      }
+
       if (authState) {
         debugLog('Auth already initializing or initialized, reusing it')
         return authState

@@ -219,9 +219,32 @@ describe('connectToRemoteServer', () => {
     // Server keeps rejecting even after reading the sibling's tokens
     mockState.connectFailuresRemaining = Number.MAX_SAFE_INTEGER
 
+    // It still stops, and now says which of the two things went wrong rather than reporting a
+    // spent retry budget the user cannot act on (issue #352)
+    await expect(connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')).rejects.toThrow(
+      'the remote server refused the tokens it wrote',
+    )
+  })
+
+  it('looks again rather than trusting a handover verdict its tokens were refused for (regression: #352)', async () => {
+    // Given a sibling that had finished signing in, whose tokens the server then refused
+    const authInitializer = vi.fn(async (options?: { forceRefresh?: boolean }) =>
+      // On the second look the sibling has released the port, so this instance signs in itself
+      options?.forceRefresh
+        ? { waitForAuthCode: async () => ({ code: 'auth-code-352' }), skipBrowserAuth: false }
+        : secondaryInstanceAuth(),
+    )
+    mockState.connectFailuresRemaining = Number.MAX_SAFE_INTEGER
+
+    // It ends on its own sign-in's budget, not on one spent waiting for the sibling
     await expect(connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')).rejects.toThrow(
       'Already attempted reconnection',
     )
+
+    // Then the handover was not the end of it: a fresh verdict was asked for, and the sign-in this
+    // instance was entitled to ran rather than being spent on the handover
+    expect(authInitializer).toHaveBeenCalledWith({ forceRefresh: true })
+    expect(mockState.finishAuthCalls).toEqual(['auth-code-352'])
   })
 
   it('does not re-exchange a spent authorization code when the retry also fails (regression: #322)', async () => {

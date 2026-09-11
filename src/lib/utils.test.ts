@@ -171,6 +171,26 @@ describe('Feature: Command Line Arguments Parsing', () => {
     const result = await parseCommandLineArgs(['https://example.com/sse'], 'test usage')
 
     expect(result.useDeviceCode).toBe(false)
+    expect(result.useClientCredentials).toBe(false)
+  })
+
+  it('Scenario: Ask to sign in as the software itself, with no user at all', async () => {
+    const result = await parseCommandLineArgs(['https://example.com/sse', '--client-credentials'], 'test usage')
+
+    expect(result.useClientCredentials).toBe(true)
+  })
+
+  it('Scenario: Take a client secret from the environment rather than the command line', async () => {
+    // A secret in argv is readable by every other process on the machine
+    vi.stubEnv('MCP_TEST_SECRET', 's3cr3t')
+
+    const result = await parseCommandLineArgs(
+      ['https://example.com/sse', '--static-oauth-client-info', '{"client_id":"c1","client_secret":"${MCP_TEST_SECRET}"}'],
+      'test usage',
+    )
+
+    expect(result.staticOAuthClientInfo).toEqual({ client_id: 'c1', client_secret: 's3cr3t' })
+    vi.unstubAllEnvs()
   })
 
   it('Scenario: Keep credentials for a metadata document client apart from registered ones', async () => {

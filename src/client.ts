@@ -42,6 +42,7 @@ async function runClient(
   clientMetadataUrl: string | undefined,
   useIdToken: boolean,
   useDeviceCode: boolean,
+  useClientCredentials: boolean,
   authorizeResource: string | undefined,
   skipResourceParameter: boolean,
   authorizeParams: Record<string, string>,
@@ -87,6 +88,7 @@ async function runClient(
     clientMetadataUrl,
     useIdToken,
     useDeviceCode,
+    useClientCredentials,
     authorizeResource,
     skipResourceParameter,
     authorizeParams,
@@ -111,8 +113,8 @@ async function runClient(
   let server: any = null
 
   // Define an auth initializer function
-  const authInitializer = async () => {
-    const authState = await authCoordinator.initializeAuth()
+  const authInitializer = async (options?: { forceRefresh?: boolean }) => {
+    const authState = await authCoordinator.initializeAuth(options)
 
     // Store server in outer scope for cleanup
     server = authState.server
@@ -213,6 +215,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
       clientMetadataUrl,
       useIdToken,
       useDeviceCode,
+      useClientCredentials,
       authorizeResource,
       skipResourceParameter,
       authorizeParams,
@@ -232,6 +235,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
         clientMetadataUrl,
         useIdToken,
         useDeviceCode,
+        useClientCredentials,
         authorizeResource,
         skipResourceParameter,
         authorizeParams,

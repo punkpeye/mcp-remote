@@ -50,6 +50,7 @@ async function runProxy(
   clientMetadataUrl: string | undefined,
   useIdToken: boolean,
   useDeviceCode: boolean,
+  useClientCredentials: boolean,
   authorizeResource: string | undefined,
   skipResourceParameter: boolean,
   authorizeParams: Record<string, string>,
@@ -98,6 +99,7 @@ async function runProxy(
     clientMetadataUrl,
     useIdToken,
     useDeviceCode,
+    useClientCredentials,
     authorizeResource,
     skipResourceParameter,
     authorizeParams,
@@ -114,8 +116,8 @@ async function runProxy(
   let server: any = null
 
   // Define an auth initializer function
-  const authInitializer = async () => {
-    const authState = await authCoordinator.initializeAuth()
+  const authInitializer = async (options?: { forceRefresh?: boolean }) => {
+    const authState = await authCoordinator.initializeAuth(options)
 
     // Store server in outer scope for cleanup
     server = authState.server
@@ -141,7 +143,8 @@ async function runProxy(
   // issued its own PKCE challenge - which is what produced one registration and one tab per
   // instance. Skipped when tokens are already on disk, so a warm start still binds nothing - and
   // skipped entirely under the device grant, which has no callback port to contend over.
-  if (!useDeviceCode && !(await hasUsableTokens(serverUrlHash)) && (await serverIssuesAuthChallenge(serverUrl, headers))) {
+  const signsInWithoutACallbackPort = useDeviceCode || useClientCredentials
+  if (!signsInWithoutACallbackPort && !(await hasUsableTokens(serverUrlHash)) && (await serverIssuesAuthChallenge(serverUrl, headers))) {
     await authInitializer()
   }
 
@@ -182,11 +185,11 @@ async function runProxy(
        * port, and the code was dropped on the floor.
        */
       reauthorize: async () => {
-        // Under the device grant the sign-in has already happened inside the SDK's redirect step,
-        // which polls to completion and writes the tokens. The retry finds them; there is no code
-        // to wait for and no port to wait on.
-        if (useDeviceCode) {
-          log('Device authorization completed; retrying with the tokens it produced')
+        // A grant that needs no browser has already finished inside the SDK's redirect step, which
+        // ran it to completion and wrote the tokens. The retry finds them; there is no code to wait
+        // for and no port to wait on.
+        if (signsInWithoutACallbackPort) {
+          log('Signed in without a browser; retrying with the tokens it produced')
           return
         }
 
@@ -276,6 +279,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
       clientMetadataUrl,
       useIdToken,
       useDeviceCode,
+      useClientCredentials,
       authorizeResource,
       skipResourceParameter,
       authorizeParams,
@@ -298,6 +302,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
         clientMetadataUrl,
         useIdToken,
         useDeviceCode,
+        useClientCredentials,
         authorizeResource,
         skipResourceParameter,
         authorizeParams,

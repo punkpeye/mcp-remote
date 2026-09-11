@@ -37,6 +37,8 @@ export interface OAuthProviderOptions {
   useIdToken?: boolean
   /** Sign in with the OAuth device grant (RFC 8628) rather than a browser on this machine */
   useDeviceCode?: boolean
+  /** Sign in as the software itself with the RFC 6749 `client_credentials` grant */
+  useClientCredentials?: boolean
   /** Resource parameter to send to the authorization server */
   authorizeResource?: string
   /** Omit the RFC 8707 resource parameter entirely (some servers reject it, e.g. Entra ID v2) */

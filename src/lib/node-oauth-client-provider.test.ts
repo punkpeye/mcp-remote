@@ -1648,3 +1648,31 @@ describe('NodeOAuthClientProvider - scope on refresh_token grants (Entra AADSTS9
     expect(mockRefresh.mock.calls[0][1].addClientAuthentication).toBe(provider.addClientAuthentication)
   })
 })
+
+describe('NodeOAuthClientProvider - a sign-in loop that never reaches a token', () => {
+  const options: OAuthProviderOptions = {
+    serverUrl: 'https://example.com/mcp',
+    callbackPort: 8080,
+    host: 'localhost',
+    serverUrlHash: 'test-hash',
+  }
+
+  beforeEach(() => {
+    vi.mocked(mcpAuthConfig.readJsonFile).mockResolvedValue(undefined as any)
+  })
+
+  it('Scenario: Stop opening browser tabs once it is clear the sign-ins are not completing', async () => {
+    // Given a reconnect loop that fails before any token is issued, so the token brake - which
+    // counts tokens written - never accumulates anything to fire on (issue #352)
+    const provider = new NodeOAuthClientProvider(options)
+    const authorize = () => provider.redirectToAuthorization(new URL('https://auth.example.com/authorize?client_id=c1'))
+
+    // Five sign-ins is already more than a person starts in half a minute
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await authorize()
+    }
+
+    // Then the next one stops rather than opening another tab
+    await expect(authorize()).rejects.toThrow('none of which completed')
+  })
+})

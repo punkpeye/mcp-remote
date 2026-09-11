@@ -460,6 +460,29 @@ yourself:
 npx mcp-remote https://example.remote/server 3334 --client-metadata-url https://client.example.com/.well-known/oauth-client-metadata
 ```
 
+### Signing In Without a User
+
+Some servers are not protected on behalf of a person at all — an internal MCP server reached by a
+scheduled job, say, where there is no user to consent and no browser to consent in. For those,
+`--client-credentials` uses the
+[OAuth Client Credentials grant](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4): the
+client presents its own credentials and is issued a token for itself.
+
+```bash
+npx mcp-remote https://example.remote/mcp \
+  --client-credentials \
+  --static-oauth-client-info '{"client_id":"my-client","client_secret":"${MCP_CLIENT_SECRET}"}'
+```
+
+The credentials come from `--static-oauth-client-info`, which accepts inline JSON or `@path/to/file.json`.
+**`${ENV_VAR}` placeholders are expanded from the environment** in both forms, so the secret need not sit
+in a command line where every other process on the machine can read it. Nothing logs the expanded value.
+
+The token endpoint, the scope and the RFC 8707 `resource` indicator are discovered and applied the same
+way as for every other flow, and `client_secret_basic` or `client_secret_post` is chosen from what the
+authorization server advertises. No refresh token is involved: the credentials are the durable thing, so
+an expired token is replaced by asking for another the same way the first was obtained.
+
 ### Signing In Without a Browser
 
 The default flow needs a browser on this machine and a loopback port to redirect back to — which a

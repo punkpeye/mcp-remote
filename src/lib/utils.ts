@@ -55,6 +55,15 @@ declare global {
 
 // Connection constants
 const REASON_AUTH_NEEDED = 'authentication-needed'
+/**
+ * Reconnecting on tokens a sibling instance signed in for.
+ *
+ * Held apart from {@link REASON_AUTH_NEEDED} because it is a different event with a different
+ * remedy: a handover costs no browser tab and no authorization code, and spending the sign-in's one
+ * allowance on it left an instance with nothing to try when the handed-over tokens were refused -
+ * so it died while the instance that wrote them went on serving (issue #352).
+ */
+const REASON_SIBLING_TOKENS = 'signed-in-by-another-instance'
 const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
 const REASON_REJECTED_TOKEN = 'server-rejected-a-freshly-issued-token'
 const DEFAULT_KEEP_ALIVE_INTERVAL_MS = 30_000
@@ -212,7 +221,7 @@ let COOKIES_ENABLED = true
  * itself to retry, and threading a flag through that recursion buys nothing over reading the one
  * decision the command line already made.
  */
-let DEVICE_CODE_FLOW = false
+let NON_INTERACTIVE_FLOW = false
 
 function cookieHeaderFor(url: string | URL): string | undefined {
   return COOKIES_ENABLED ? cookieJar.header(url) : undefined
@@ -1245,11 +1254,41 @@ export async function discoverOAuthServerInfo(
 
 /**
  * Type for the auth initialization function
+ *
+ * `forceRefresh` discards a verdict this instance has already acted on. The coordinator caches what
+ * it decided, which is right while the decision still holds - and wrong once the tokens a sibling
+ * wrote have been refused, because the cache keeps answering "wait for the sibling" to an instance
+ * that now needs to sign in itself (see https://github.com/punkpeye/mcp-remote/issues/352).
  */
-export type AuthInitializer = () => Promise<{
+export type AuthInitializer = (options?: { forceRefresh?: boolean }) => Promise<{
   waitForAuthCode: () => Promise<AuthCodeResult>
   skipBrowserAuth: boolean
 }>
+
+/**
+ * Expands `${VAR}` placeholders from the environment.
+ *
+ * The values this is used on - bearer tokens, client secrets - are the ones that should least be
+ * sitting in a command line, where every other process on the machine can read them. Only the
+ * placeholder and where it appeared are logged, never what it expanded to.
+ *
+ * @param value The string to expand
+ * @param context Where the value came from, for the log line when a variable is missing
+ * @returns The string with every placeholder replaced
+ */
+function substituteEnvVars(value: string, context: string): string {
+  return value.replace(/\$\{([^}]+)}/g, (match, envVarName) => {
+    const envVarValue = process.env[envVarName]
+
+    if (envVarValue !== undefined) {
+      log(`Replacing ${match} with environment value in ${context}`)
+      return envVarValue
+    }
+
+    log(`Warning: Environment variable '${envVarName}' not found for ${context}.`)
+    return ''
+  })
+}
 
 /** The header shapes `fetch` accepts, plus the `Headers` the SDK actually hands over. */
 type HeaderSource = RequestInit['headers'] | Headers | globalThis.Headers | undefined
@@ -1508,11 +1547,11 @@ export async function connectToRemoteServer(
         throw new Error(errorMessage, { cause: error })
       }
 
-      // The device grant has already finished by the time this is reached: the SDK's redirect
-      // step ran the whole flow and wrote the tokens. Nothing is coming to a callback port, so
-      // starting one would only bind a port nobody will ever call.
-      if (DEVICE_CODE_FLOW) {
-        log('Device authorization completed - reconnecting with the tokens it produced')
+      // A non-interactive grant has already finished by the time this is reached: the SDK's
+      // redirect step ran the whole flow and wrote the tokens. Nothing is coming to a callback
+      // port, so starting one would only bind a port nobody will ever call.
+      if (NON_INTERACTIVE_FLOW) {
+        log('Signed in without a browser - reconnecting with the tokens it produced')
         giveUpIfAlreadyRetried()
 
         recursionReasons.add(REASON_AUTH_NEEDED)
@@ -1528,9 +1567,12 @@ export async function connectToRemoteServer(
         )
       }
 
-      // Initialize authentication on-demand
+      // Initialize authentication on-demand. A handover already tried and refused must not be
+      // handed back from cache, or this instance keeps being told to wait for a sign-in that has
+      // already happened rather than running one of its own.
       debugLog('Calling authInitializer to start auth flow')
-      const { waitForAuthCode, skipBrowserAuth } = await authInitializer()
+      const handoverAlreadyTried = recursionReasons.has(REASON_SIBLING_TOKENS)
+      const { waitForAuthCode, skipBrowserAuth } = await authInitializer({ forceRefresh: handoverAlreadyTried })
 
       // A concurrent instance ran the browser flow for us and persisted the tokens. There is no
       // authorization code of our own to exchange - our callback server never received one, and
@@ -1538,10 +1580,17 @@ export async function connectToRemoteServer(
       // that never settles (see coordinateAuth). Reconnect instead, which makes the auth provider
       // re-read the tokens the sibling wrote (see https://github.com/geelen/mcp-remote/issues/322).
       if (skipBrowserAuth) {
-        log('Authentication was completed by another instance - reconnecting with the tokens it wrote')
-        giveUpIfAlreadyRetried()
+        // Refreshed above and still a follower: the sibling holds the callback port, and the tokens
+        // it wrote have already been refused once. `waitForAuthCode` below would wait on a code
+        // that is never coming, so this ends here - saying which of the two things went wrong.
+        if (handoverAlreadyTried) {
+          log('Another instance owns the sign-in, and the tokens it wrote were refused; giving up')
+          throw new Error('Another instance completed the sign-in, but the remote server refused the tokens it wrote', { cause: error })
+        }
 
-        recursionReasons.add(REASON_AUTH_NEEDED)
+        log('Authentication was completed by another instance - reconnecting with the tokens it wrote')
+
+        recursionReasons.add(REASON_SIBLING_TOKENS)
         debugLog('Recursively reconnecting using a sibling instance tokens', {
           recursionReasons: Array.from(recursionReasons),
         })
@@ -2167,10 +2216,10 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     const staticOAuthClientInfoArg = args[staticOAuthClientInfoIndex + 1]
     if (staticOAuthClientInfoArg.startsWith('@')) {
       const filePath = staticOAuthClientInfoArg.slice(1)
-      staticOAuthClientInfo = JSON.parse(await readFile(filePath, 'utf8'))
+      staticOAuthClientInfo = JSON.parse(substituteEnvVars(await readFile(filePath, 'utf8'), 'static OAuth client information'))
       log(`Using static OAuth client information from file: ${filePath}`)
     } else {
-      staticOAuthClientInfo = JSON.parse(staticOAuthClientInfoArg)
+      staticOAuthClientInfo = JSON.parse(substituteEnvVars(staticOAuthClientInfoArg, 'static OAuth client information'))
       log(`Using static OAuth client information from string`)
     }
   }
@@ -2196,10 +2245,18 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
 
   // No browser on this machine: sign in from wherever the person actually is
   const useDeviceCode = args.includes('--device-code')
-  DEVICE_CODE_FLOW = useDeviceCode
   if (useDeviceCode) {
     log('Using the OAuth device grant; no browser will be opened on this machine')
   }
+
+  // No person at all: the client is the one being authorized
+  const useClientCredentials = args.includes('--client-credentials')
+  if (useClientCredentials) {
+    log('Using the OAuth client_credentials grant; no browser will be opened and no user will be asked')
+  }
+
+  // Both finish inside the provider's redirect step, so neither has a code arriving at a port
+  NON_INTERACTIVE_FLOW = useDeviceCode || useClientCredentials
 
   // An MCP server that verifies who the caller is, rather than what they may do, wants the ID token
   const useIdToken = args.includes('--use-id-token')
@@ -2327,17 +2384,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   // Replace environment variables in headers
   // example `Authorization: Bearer ${TOKEN}` will read process.env.TOKEN
   for (const [key, value] of Object.entries(headers)) {
-    headers[key] = value.replace(/\$\{([^}]+)}/g, (match, envVarName) => {
-      const envVarValue = process.env[envVarName]
-
-      if (envVarValue !== undefined) {
-        log(`Replacing ${match} with environment value in header '${key}'`)
-        return envVarValue
-      } else {
-        log(`Warning: Environment variable '${envVarName}' not found for header '${key}'.`)
-        return ''
-      }
-    })
+    headers[key] = substituteEnvVars(value, `header '${key}'`)
   }
 
   return {
@@ -2354,6 +2401,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     clientMetadataUrl,
     useIdToken,
     useDeviceCode,
+    useClientCredentials,
     authorizeResource,
     skipResourceParameter,
     authorizeParams,
