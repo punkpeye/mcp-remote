@@ -553,6 +553,14 @@ export function mcpProxy({
   let activeStream: { reopen: () => void } | undefined
   /** Wakes a loop that is idling because there is nothing to listen for yet. */
   let wakeIdleWait: (() => void) | undefined
+  /**
+   * Whether to leave resource subscriptions out of the filter.
+   *
+   * Set when a server refuses a filter that named them, so the rest of the subscription survives -
+   * and cleared again the next time the client changes what it wants, because the refusal was about
+   * the resources it named then, not about every resource it will ever name.
+   */
+  let dropResourceSubscriptions = false
   /** The remote-side id a client request is currently being retried under, for cancellation. */
   const modernRetryIds = new Map<string | number, string>()
   /** Exchanges the client has cancelled, whose eventual answer is no longer wanted. */
@@ -745,7 +753,7 @@ export function mcpProxy({
       return
     }
 
-    if (typeof incomingId === 'string') {
+    if (isOwnId(incomingId)) {
       if (pendingPings.delete(incomingId)) return
 
       for (const pending of [pendingOwnRequests, pendingDiscover, pendingReinit]) {
@@ -756,6 +764,12 @@ export function mcpProxy({
           return
         }
       }
+
+      // Nothing is waiting on it: a duplicate, or the answer to something this proxy cancelled and
+      // the server had already begun answering. Forwarding it would hand the client an id it never
+      // used - and since client requests are kept out of this namespace, it cannot be the client's.
+      debugLog('Discarding an answer to a request this proxy is no longer waiting on', { id: incomingId })
+      return
     }
 
     // Confirmation of a stream this proxy opened for the client, which the client never asked for
@@ -1024,44 +1038,17 @@ export function mcpProxy({
    * The id is minted here and recorded, so the answer is recognised on the way back and consumed
    * rather than forwarded to a client that never asked the question.
    *
+   * `cancelled`, if given, gives up on the answer: it clears the timer, releases the record, and
+   * tells the server - because a `subscriptions/listen` that is abandoned rather than cancelled
+   * stays open and goes on delivering, so a client that resubscribes would see every change once
+   * per filter it had ever asked for.
+   *
    * @param build Given the minted id, the message to send
    * @param timeoutMs How long to wait before giving up on an answer
+   * @param cancelled Rejects to abandon the request
    * @returns The response the remote sent
    */
-  /**
-   * {@link askRemote}, with a handle to give up on the answer.
-   *
-   * Giving up has to reach the server, not just this process: a `subscriptions/listen` that is
-   * abandoned rather than cancelled stays open and goes on delivering, so a client that subscribes
-   * three times would see every change three times over, from three streams nobody is tracking.
-   *
-   * @returns The answer, and a `cancel` that ends the request at both ends
-   */
-  function askRemoteCancellable(build: (id: string) => Message, timeoutMs: number): { answer: Promise<Message>; cancel: () => void } {
-    let cancel = () => {}
-
-    const answer = new Promise<Message>((resolve, reject) => {
-      const cancelled = new Promise<never>((_, rejectCancelled) => {
-        cancel = () => {
-          rejectCancelled(new Error('the request was cancelled'))
-        }
-      })
-
-      askRemote(build, timeoutMs, (id) => {
-        // Told to stop, so the server is told too - and its pending entry released here
-        void cancelled.catch(() => {
-          pendingOwnRequests.delete(id)
-          transportToServer.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id } }).catch(() => {})
-        })
-      }).then(resolve, reject)
-
-      cancelled.catch(reject)
-    })
-
-    return { answer, cancel }
-  }
-
-  async function askRemote(build: (id: string) => Message, timeoutMs: number, onSent?: (id: string) => void): Promise<Message> {
+  async function askRemote(build: (id: string) => Message, timeoutMs: number, cancelled?: Promise<never>): Promise<Message> {
     const id = `mcp-remote-own-${++ownRequestSeq}`
 
     // The same barrier `sendToServer` waits on. Without it a retry leg is POSTed onto the session
@@ -1078,16 +1065,26 @@ export function mcpProxy({
       }, timeoutMs)
       timer.unref?.()
 
-      pendingOwnRequests.set(id, (message) => {
+      // Everything that ends the wait comes through here, so a cancelled request leaves neither an
+      // armed 24-hour timer nor a record of an answer nobody is listening for
+      const release = () => {
         clearTimeout(timer)
+        pendingOwnRequests.delete(id)
+      }
+
+      pendingOwnRequests.set(id, (message) => {
+        release()
         resolve(message)
       })
 
-      onSent?.(id)
+      cancelled?.catch((reason) => {
+        release()
+        transportToServer.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id } }).catch(() => {})
+        reject(reason)
+      })
 
       transportToServer.send(build(id)).catch((error) => {
-        clearTimeout(timer)
-        pendingOwnRequests.delete(id)
+        release()
         reject(error)
       })
     })
@@ -1145,22 +1142,23 @@ export function mcpProxy({
       activeStream?.reopen()
     }
 
-    // Dropped after a refusal that named them, so one unsupported resource cannot cost the client
-    // the tools and prompts notifications it was already getting.
-    let includeResourceSubscriptions = true
-
     // A stream is not a session: it ends on a server restart, a load balancer's idle timeout, or a
     // network flake, and the client would go on believing nothing has changed since. Reopening is
     // the only thing that turns that back into a working subscription, because nothing below this
     // notices it stopped.
-    for (let attempts = 0; attempts < SUBSCRIPTION_REOPEN_LIMIT; attempts++) {
-      const notifications = subscriptionFilterFor(capabilities, includeResourceSubscriptions ? [...subscribedResources] : [])
+    // Counts only streams the *server* ended as soon as they opened. A reopen the client asked
+    // for is ordinary work and spends none of this budget, or a client that subscribes a few times
+    // would exhaust a limit written for a server that will not hold a stream open.
+    let shortLivedStreams = 0
+
+    while (shortLivedStreams < SUBSCRIPTION_REOPEN_LIMIT) {
+      const notifications = subscriptionFilterFor(capabilities, dropResourceSubscriptions ? [] : [...subscribedResources])
 
       if (!notifications) {
         // Nothing to listen for yet. A later `resources/subscribe` is what gives this a reason to
         // exist, so this waits for one rather than giving up on the session.
         debugLog('Nothing to subscribe to yet; waiting for the client to ask for something')
-        attempts = -1
+        shortLivedStreams = 0
         if (!(await waitForSubscriptionChange())) return
         continue
       }
@@ -1172,27 +1170,28 @@ export function mcpProxy({
         debugLog('Subscribing to change notifications on the client behalf', { notifications })
         // Resolves only when the stream ends, so this bounds a session's worth of notifications
         // rather than a request
-        const stream = askRemoteCancellable(
+        const cancelled = new Promise<never>((_, rejectStream) => {
+          activeStream = {
+            reopen: () => {
+              reopening = true
+              // Cancelled rather than abandoned: a stream left open goes on delivering, so the
+              // client would see every change once per filter it has ever asked for
+              rejectStream(new Error('the subscription is being reopened against a new filter'))
+            },
+          }
+        })
+
+        const response = await askRemote(
           (id: string) => subscriptionsListenRequest(id, clientIdentity, version, notifications) as Message,
           SUBSCRIPTION_LIFETIME_MS,
+          cancelled,
         )
-        activeStream = {
-          reopen: () => {
-            reopening = true
-            // Cancelled rather than abandoned: a stream left open goes on delivering, so the client
-            // would see every change once per filter it has ever asked for
-            stream.cancel()
-          },
-        }
-
-        const response = await stream.answer
 
         if (response.error) {
-          if (includeResourceSubscriptions && subscribedResources.size > 0) {
+          if (!dropResourceSubscriptions && subscribedResources.size > 0) {
             // The filter named resources; the rest of it may still be perfectly acceptable
             log(`The remote server refused a subscription naming resources; listening for the rest: ${JSON.stringify(response.error)}`)
-            includeResourceSubscriptions = false
-            attempts = -1
+            dropResourceSubscriptions = true
             continue
           }
 
@@ -1205,7 +1204,10 @@ export function mcpProxy({
       } catch (error) {
         if (reopening) {
           debugLog('Reopening the change-notification stream against a filter the client changed')
-          attempts = -1
+          if (transportToClientClosed || transportToServerClosed) return
+          // Debounced, so a client that subscribes in a tight loop cannot turn each call into an
+          // immediate round trip
+          await sleep(SUBSCRIPTION_REOPEN_DELAY_MS)
           if (transportToClientClosed || transportToServerClosed) return
           continue
         }
@@ -1218,7 +1220,8 @@ export function mcpProxy({
       // budget starts again. One that ended immediately is a server that does not really hold this
       // open, and reopening it on a timer is how a proxy comes to send thousands of requests an
       // hour to a server that answered the first one perfectly politely.
-      if (Date.now() - openedAt >= SUBSCRIPTION_HELD_OPEN_MS) attempts = -1
+      if (Date.now() - openedAt >= SUBSCRIPTION_HELD_OPEN_MS) shortLivedStreams = 0
+      else shortLivedStreams++
 
       if (transportToClientClosed || transportToServerClosed) return
 
@@ -1288,6 +1291,9 @@ export function mcpProxy({
       // complain about an unknown message id.
       if (cancelledExchanges.delete(message.id)) {
         debugLog('Dropping an answer to an exchange the client had already given up on', { id: message.id })
+        // Called for its effect, not its result: it is what releases the transformer's hold on the
+        // original request, which would otherwise be kept for the life of the process
+        messageTransformer.interceptResponse(message)
         return
       }
     }
@@ -1498,9 +1504,11 @@ export function mcpProxy({
         // These are retired methods whose effect this proxy still owes the client
         if (message.method === RETIRED_IN_MODERN_ERA.subscribeResource && typeof message.params?.uri === 'string') {
           subscribedResources.add(message.params.uri)
+          dropResourceSubscriptions = false
           refreshSubscription?.()
         } else if (message.method === RETIRED_IN_MODERN_ERA.unsubscribeResource && typeof message.params?.uri === 'string') {
           subscribedResources.delete(message.params.uri)
+          dropResourceSubscriptions = false
           refreshSubscription?.()
         } else if (message.method === RETIRED_IN_MODERN_ERA.setLogLevel && typeof message.params?.level === 'string') {
           requestedLogLevel = message.params.level
@@ -1691,10 +1699,12 @@ export function mcpProxy({
     debugLog('Failing requests the dropped session can no longer answer', { ids: [...pendingRequests] })
     for (const id of pendingRequests) {
       transportToClient.send({ jsonrpc: '2.0', id, error: { code: -32001, message: `mcp-remote: ${reason}` } }).catch(onClientError)
-      // Answered now, so there is nothing left to retry a multi-round-trip exchange for
+      // Answered now, so there is nothing left to retry a multi-round-trip exchange for - and an
+      // exchange still running has to be stopped from answering this id a second time when it
+      // eventually finishes
       modernOriginals.delete(id)
       modernRetryIds.delete(id)
-      cancelledExchanges.delete(id)
+      cancelledExchanges.add(id)
     }
     pendingRequests.clear()
   }
