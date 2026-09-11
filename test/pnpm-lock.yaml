@@ -11,6 +11,9 @@ importers:
       '@modelcontextprotocol/client':
         specifier: ^2.0.0
         version: 2.0.0
+      '@modelcontextprotocol/server':
+        specifier: ^2.0.0
+        version: 2.0.0
       '@types/node':
         specifier: ^22.10.2
         version: 22.19.0
@@ -20,6 +23,9 @@ importers:
       vitest:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.19.0)
+      zod:
+        specifier: ^4.0.0
+        version: 4.6.2
 
 packages:
 
@@ -170,6 +176,10 @@ packages:
 
   '@modelcontextprotocol/core@2.0.0':
     resolution: {integrity: sha512-pJCEwGG7Lfr/+PQp9ZTwKXNeO5wzbfKL7H3MYpCorM4oFBoQrdjnBgEoqG+RjhsvS1FKrDbKux+M1HhlnGWqcA==}
+    engines: {node: '>=20'}
+
+  '@modelcontextprotocol/server@2.0.0':
+    resolution: {integrity: sha512-YhHWdHfpFMQfd0prsEnxKeS3Qz3ytIGmsS0sth4KDjnacIT7hxk6hXHkJ9KysxlkvTM+WZAtQbbcUhdoP4Hvtw==}
     engines: {node: '>=20'}
 
   '@rollup/rollup-android-arm-eabi@4.52.5':
@@ -887,6 +897,11 @@ snapshots:
 
   '@modelcontextprotocol/core@2.0.0':
     dependencies:
+      zod: 4.6.2
+
+  '@modelcontextprotocol/server@2.0.0':
+    dependencies:
+      '@modelcontextprotocol/core': 2.0.0
       zod: 4.6.2
 
   '@rollup/rollup-android-arm-eabi@4.52.5':

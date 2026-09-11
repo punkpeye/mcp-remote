@@ -24,6 +24,7 @@ import {
   forgetRejectedAuthorization,
 } from './lib/utils'
 import { KeepAliveConfig, StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
+import type { ProtocolMode } from './lib/protocol-era'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator, hasUsableTokens, serverIssuesAuthChallenge } from './lib/coordination'
 
@@ -56,6 +57,7 @@ async function runProxy(
   authTimeoutMs: number,
   serverUrlHash: string,
   keepAlive: KeepAliveConfig,
+  protocolMode: ProtocolMode,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -145,7 +147,15 @@ async function runProxy(
 
   try {
     // Connect to remote server with lazy authentication
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    const remoteTransport = await connectToRemoteServer(
+      null,
+      serverUrl,
+      authProvider,
+      headers,
+      authInitializer,
+      transportStrategy,
+      protocolMode,
+    )
 
     // Set up bidirectional proxy between local and remote transports
     mcpProxy({
@@ -153,6 +163,7 @@ async function runProxy(
       transportToServer: remoteTransport,
       ignoredTools,
       keepAlive,
+      protocolMode,
       /**
        * Discards a token the server refused straight after issuing it.
        *
@@ -272,6 +283,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
       authTimeoutMs,
       serverUrlHash,
       keepAlive,
+      protocolMode,
     }) => {
       return runProxy(
         serverUrl,
@@ -293,6 +305,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
         authTimeoutMs,
         serverUrlHash,
         keepAlive,
+        protocolMode,
       )
     },
   )

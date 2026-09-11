@@ -11,8 +11,10 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
     "@types/node": "^22.10.2",
     "express": "^4.21.2",
-    "vitest": "^2.1.8"
+    "vitest": "^2.1.8",
+    "zod": "^4.0.0"
   }
 }

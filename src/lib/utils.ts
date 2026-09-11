@@ -11,6 +11,18 @@ import {
 } from '@modelcontextprotocol/client'
 import type { FetchLike, OAuthClientInformationFull, Transport } from '@modelcontextprotocol/client'
 import {
+  discoverRequest,
+  isDroppedInModernEra,
+  localAnswerFor,
+  readEraFromDiscoverResponse,
+  stampModernMeta,
+  synthesizeInitializeResult,
+  translateModernResult,
+  type EraVerdict,
+  type LegacyClientIdentity,
+  type ProtocolMode,
+} from './protocol-era'
+import {
   AuthCodeResult,
   KeepAliveConfig,
   OAuthCallbackServerOptions,
@@ -337,6 +349,14 @@ const LIFECYCLE_BARRIER_TIMEOUT_MS = 10_000
  */
 const INITIALIZE_TIMEOUT_MS = 30_000
 
+/**
+ * How long to wait for `server/discover` before deciding no modern server is listening.
+ *
+ * Shorter than the handshake's own budget on purpose: this runs before the client has been told
+ * anything, and every millisecond spent here is added to a startup that used to have none.
+ */
+const DISCOVER_TIMEOUT_MS = 10_000
+
 /** A timer that never keeps the process alive on its own. */
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -413,6 +433,7 @@ export function mcpProxy({
   transportToServer,
   ignoredTools = [],
   keepAlive,
+  protocolMode = 'legacy',
   reauthorize,
   forgetRejectedAuthorization: forgetRejectedTokens,
 }: {
@@ -421,6 +442,14 @@ export function mcpProxy({
   ignoredTools?: string[]
   /** Pings the server on an interval, so a connection carrying no traffic is not reaped */
   keepAlive?: KeepAliveConfig
+  /**
+   * Whether to look for a `2026-07-28` server before handing it a handshake it no longer answers.
+   *
+   * `legacy` forwards the client's `initialize` untouched, as every release before this one did.
+   * `auto` spends one `server/discover` on the first handshake and bridges the eras if it finds a
+   * modern server. See {@link ./protocol-era.ts}.
+   */
+  protocolMode?: ProtocolMode
   /**
    * Completes a sign-in for a request the server refused, or undefined to answer with the error.
    *
@@ -447,6 +476,14 @@ export function mcpProxy({
   let pingSeq = 0
   let keepAliveTimer: NodeJS.Timeout | null = null
   let initializedDelivered: Promise<unknown> | null = null
+  /** Set once the probe has run. Until then nothing is known about which era the server belongs to. */
+  let era: EraVerdict | null = null
+  /** What the client said in its `initialize`, replayed into the `_meta` of every modern request. */
+  let clientIdentity: LegacyClientIdentity = {}
+  /** In-flight `server/discover` probe. Everything the client sends queues behind it. */
+  let eraNegotiation: Promise<void> | null = null
+  let discoverSeq = 0
+  const pendingDiscover = new Map<string, (message: Message) => void>()
   let reauthorizeInFlight: Promise<void> | null = null
   /** In-flight recovery from a reconnected stream. See `onStreamReconnect` below. */
   let sessionResumption: Promise<void> | null = null
@@ -480,7 +517,17 @@ export function mcpProxy({
       }
       return request
     },
-    transformResponseFunction: (req: Message, res: Message) => {
+    transformResponseFunction: (req: Message, response: Message) => {
+      let res = response
+
+      // A modern result is tagged with a `resultType` a 2025-era client has never heard of, and one
+      // of those tags - `input_required` - is a question this client has no way to answer
+      if (era?.era === 'modern' && res.result !== undefined) {
+        const translated = translateModernResult(res.result)
+        if ('error' in translated) return { jsonrpc: '2.0' as const, id: res.id, error: translated.error }
+        res = { ...res, result: translated.result }
+      }
+
       if (req.method !== 'tools/list') return res
       // Not every answer to tools/list carries a tool list: a JSON-RPC error response has no
       // `result` at all, and a server may answer with one that omits `tools`. Filtering either
@@ -524,6 +571,20 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
 
       lastInitialize = message
+      clientIdentity = {
+        protocolVersion: message.params?.protocolVersion,
+        capabilities: message.params?.capabilities ?? {},
+        clientInfo,
+      }
+
+      // The handshake is the only moment the era can be settled: it is the first thing the client
+      // sends, and how every message after it has to be written depends on the answer.
+      if (protocolMode === 'auto' && era === null) {
+        eraNegotiation = negotiateEra(message).finally(() => {
+          eraNegotiation = null
+        })
+        return
+      }
     }
 
     forwardInOrder(message)
@@ -535,6 +596,14 @@ export function mcpProxy({
     // Answers to our own keep-alive pings are ours to consume too. The client never sent the
     // request, so forwarding the response would hand it an id it has nothing to match against.
     if (typeof incomingId === 'string' && pendingPings.delete(incomingId)) {
+      return
+    }
+
+    // The answer to our own era probe is ours to consume too - the client never asked for it
+    if (typeof incomingId === 'string' && pendingDiscover.has(incomingId)) {
+      const settle = pendingDiscover.get(incomingId)!
+      pendingDiscover.delete(incomingId)
+      settle(_message as any)
       return
     }
 
@@ -688,6 +757,75 @@ export function mcpProxy({
     }
   }
 
+  /**
+   * Finds out which era the remote server belongs to, and answers the client's handshake either way.
+   *
+   * The probe is one `server/discover`, and the spec makes its answer the evidence: a `DiscoverResult`
+   * is a modern server, a *recognised modern error* is a modern server that cannot meet us, and
+   * anything else at all - `-32601`, a transport failure, silence - is a server still expecting the
+   * handshake this client sent. Only the first of those changes what happens next; the rest end with
+   * the `initialize` going out exactly as it did before any of this existed.
+   *
+   * @param initialize The client's handshake, held back until there is something to do with it
+   */
+  async function negotiateEra(initialize: Message): Promise<void> {
+    const id = `mcp-remote-discover-${++discoverSeq}`
+
+    try {
+      const response = await new Promise<Message>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingDiscover.delete(id)
+          reject(new Error('timed out waiting for the server/discover response'))
+        }, DISCOVER_TIMEOUT_MS)
+        timer.unref?.()
+        pendingDiscover.set(id, (message) => {
+          clearTimeout(timer)
+          resolve(message)
+        })
+        transportToServer.send(discoverRequest(id, clientIdentity)).catch((error) => {
+          clearTimeout(timer)
+          pendingDiscover.delete(id)
+          reject(error)
+        })
+      })
+      era = readEraFromDiscoverResponse(response)
+    } catch (error) {
+      debugLog('server/discover produced no evidence of a modern server', error)
+      era = { era: 'legacy', reason: (error as Error).message }
+    }
+
+    if (era.era === 'modern') {
+      log(`Remote server speaks MCP ${era.version}; answering the local client's handshake here and bridging every request`)
+      debugLog('Bridging to a modern server', { version: era.version, capabilities: era.discover.capabilities })
+
+      // Nothing will answer an `initialize` we never send, and the header has to name the revision
+      // the `_meta` of every request will, or the server answers -32020
+      initializeRequestId = undefined
+      transportToServer.setProtocolVersion?.(era.version)
+
+      transportToClient
+        .send({ jsonrpc: '2.0', id: initialize.id, result: synthesizeInitializeResult(era.discover, clientIdentity) })
+        .catch(onClientError)
+      return
+    }
+
+    if (era.era === 'incompatible') {
+      // Falling back to `initialize` here would fail too, and hide why it failed
+      log(`Cannot bridge to this server: ${era.reason}`)
+      transportToClient
+        .send({
+          jsonrpc: '2.0',
+          id: initialize.id,
+          error: { code: -32603, message: `mcp-remote cannot bridge to this server: ${era.reason}` },
+        })
+        .catch(onClientError)
+      return
+    }
+
+    debugLog('Treating the remote server as legacy', { reason: era.reason })
+    void sendToServer(initialize)
+  }
+
   let reinitInFlight: Promise<void> | null = null
 
   /** Coalesces concurrent callers so several in-flight 404s produce one new session, not one each */
@@ -756,6 +894,10 @@ export function mcpProxy({
    */
   function startKeepAlive(intervalMs: number) {
     const timer = setInterval(() => {
+      // `ping` is not a method the 2026-07-28 era defines, and a stateless server has no session
+      // whose liveness could lapse in the first place - so there is nothing here to keep alive.
+      if (era?.era === 'modern') return
+
       const id = `mcp-remote-keepalive-${++pingSeq}`
       pendingPings.add(id)
       transportToServer.send({ jsonrpc: '2.0', id, method: 'ping' }).catch((error) => {
@@ -794,6 +936,26 @@ export function mcpProxy({
    * requests into sequential ones.
    */
   function forwardInOrder(message: Message) {
+    // Nothing can be written correctly until the probe has said which era to write it in
+    if (eraNegotiation) {
+      void eraNegotiation.then(() => forwardInOrder(message))
+      return
+    }
+
+    if (era?.era === 'modern') {
+      const answer = message.method ? localAnswerFor(message.method) : undefined
+      if (answer && message.id !== undefined && message.id !== null) {
+        debugLog('Answering locally a method the modern era does not define', { method: message.method })
+        transportToClient.send({ jsonrpc: '2.0', id: message.id, result: answer }).catch(onClientError)
+        return
+      }
+
+      if (message.method && isDroppedInModernEra(message.method)) {
+        debugLog('Dropping a notification the modern era has no place for', { method: message.method })
+        return
+      }
+    }
+
     if (message.method === 'notifications/initialized') {
       // Bounded, because a server that never answers the notification must not leave every later
       // request queued behind it forever - racing ahead is the lesser failure.
@@ -845,8 +1007,12 @@ export function mcpProxy({
     const awaitsAnswer = message.method !== undefined && message.id !== undefined && message.id !== null
     if (awaitsAnswer) pendingRequests.add(message.id!)
 
+    // Stamped here rather than in the transformer because the transformer runs the moment the
+    // client's message arrives, which can be before the probe has said which era to speak.
+    const outgoing = era?.era === 'modern' && awaitsAnswer ? stampModernMeta(message, clientIdentity, era.version) : message
+
     try {
-      await transportToServer.send(message)
+      await transportToServer.send(outgoing)
       if (message.method === 'initialize') scheduleInitializeTimeout(message)
       return
     } catch (error) {
@@ -1135,6 +1301,7 @@ export function mergeHeaders(...sources: HeaderSource[]): Record<string, string>
  * @param headers Additional headers to send with the request
  * @param authInitializer Function to initialize authentication when needed
  * @param transportStrategy Strategy for selecting transport type ('sse-only', 'http-only', 'sse-first', 'http-first')
+ * @param protocolMode Whether to look for a 2026-07-28 server rather than assume an `initialize` handshake
  * @param recursionReasons Set of reasons for recursive calls (internal use)
  * @returns The connected transport
  */
@@ -1145,6 +1312,7 @@ export async function connectToRemoteServer(
   headers: Record<string, string>,
   authInitializer: AuthInitializer,
   transportStrategy: TransportStrategy = 'http-first',
+  protocolMode: ProtocolMode = 'legacy',
   recursionReasons: Set<string> = new Set(),
 ): Promise<Transport> {
   log(`[${pid}] Connecting to remote server: ${serverUrl}`)
@@ -1244,7 +1412,13 @@ export async function connectToRemoteServer(
         })
         // This transport is the one that will receive (and store the metadata from) any 401 challenge.
         authChallengeTransport = testTransport
-        const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
+        // The probe opens the connection, so it is the thing that meets a 2026-07-28 server first.
+        // Left in the default era it would send an `initialize` that server retired, and fail the
+        // connection before `mcpProxy` ever got to bridge anything - so it negotiates too.
+        const testClient = new Client(
+          { name: 'mcp-remote-fallback-test', version: '0.0.0' },
+          { capabilities: {}, ...(protocolMode === 'auto' ? { versionNegotiation: { mode: 'auto' as const } } : {}) },
+        )
         await testClient.connect(testTransport)
       }
     }
@@ -1288,6 +1462,7 @@ export async function connectToRemoteServer(
         headers,
         authInitializer,
         sseTransport ? 'http-only' : 'sse-only',
+        protocolMode,
         recursionReasons,
       )
     } else if (isRejectedAfterAuthorizing(error)) {
@@ -1305,7 +1480,16 @@ export async function connectToRemoteServer(
       await forgetRejectedAuthorization(authProvider)
 
       recursionReasons.add(REASON_REJECTED_TOKEN)
-      return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+      return connectToRemoteServer(
+        client,
+        serverUrl,
+        authProvider,
+        headers,
+        authInitializer,
+        transportStrategy,
+        protocolMode,
+        recursionReasons,
+      )
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
       log('Authentication required. Initializing auth...')
       debugLog('Authentication error detected', {
@@ -1332,7 +1516,16 @@ export async function connectToRemoteServer(
         giveUpIfAlreadyRetried()
 
         recursionReasons.add(REASON_AUTH_NEEDED)
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          protocolMode,
+          recursionReasons,
+        )
       }
 
       // Initialize authentication on-demand
@@ -1352,7 +1545,16 @@ export async function connectToRemoteServer(
         debugLog('Recursively reconnecting using a sibling instance tokens', {
           recursionReasons: Array.from(recursionReasons),
         })
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          protocolMode,
+          recursionReasons,
+        )
       }
 
       log('Authentication required. Waiting for authorization...')
@@ -1386,7 +1588,16 @@ export async function connectToRemoteServer(
         debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
 
         // Recursively call connectToRemoteServer with the updated recursion tracking
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          protocolMode,
+          recursionReasons,
+        )
       } catch (authError: any) {
         log('Authorization error:', authError)
         debugLog('Authorization error during finishAuth', {
@@ -1896,6 +2107,19 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
 
+  // Parse protocol mode
+  let protocolMode: ProtocolMode = 'legacy'
+  const protocolIndex = args.indexOf('--protocol')
+  if (protocolIndex !== -1 && protocolIndex < args.length - 1) {
+    const mode = args[protocolIndex + 1]
+    if (mode === 'legacy' || mode === 'auto') {
+      protocolMode = mode
+      log(`Using protocol mode: ${protocolMode}`)
+    } else {
+      log(`Warning: Ignoring invalid protocol mode: ${mode}. Valid values are: legacy, auto`)
+    }
+  }
+
   // Parse host
   let host = process.platform === 'win32' ? '127.0.0.1' : 'localhost' // Default
   const hostIndex = args.indexOf('--host')
@@ -2137,6 +2361,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     authTimeoutMs,
     serverUrlHash,
     keepAlive,
+    protocolMode,
   }
 }
 

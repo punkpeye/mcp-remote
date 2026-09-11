@@ -2780,6 +2780,241 @@ describe('setupOAuthCallbackServerWithLongPoll', () => {
   })
 })
 
+/**
+ * The 2026-07-28 revision retired the `initialize` handshake, so a desktop host that still sends one
+ * cannot reach a server that has moved on - the spec's compatibility matrix puts that pair in the one
+ * cell that simply fails. The fix it names is a dual-era *client*, and between the two ends sits this
+ * proxy. See https://github.com/punkpeye/mcp-remote/issues/356.
+ */
+describe('Feature: Bridging a legacy client to a 2026-07-28 server', () => {
+  const INITIALIZE = {
+    jsonrpc: '2.0' as const,
+    method: 'initialize',
+    id: 'init-1',
+    params: {
+      protocolVersion: '2025-11-25',
+      capabilities: { roots: {} },
+      clientInfo: { name: 'desktop-host', version: '0.1.0' },
+    },
+  }
+
+  const DISCOVER_RESULT = { supportedVersions: ['2026-07-28'], capabilities: { tools: {} } }
+
+  const clientTransport = (sent: any[]) =>
+    ({
+      send: vi.fn(async (message: any) => {
+        sent.push(message)
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    }) as unknown as Transport
+
+  /** A remote transport that answers whatever `respond` decides, on the next turn of the loop. */
+  const serverTransport = (sent: any[], respond: (message: any) => any | undefined) => {
+    const transport: any = {
+      send: vi.fn(async (message: any) => {
+        sent.push(message)
+        const reply = respond(message)
+        if (reply) queueMicrotask(() => transport.onmessage?.(reply))
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      setProtocolVersion: vi.fn(),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    }
+    return transport
+  }
+
+  const answerDiscover = (result: any) => (message: any) =>
+    message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result } : undefined
+
+  it('Scenario: The handshake is answered here, from what server/discover advertised', async () => {
+    // Given a server on the modern era, which has no answer for `initialize` at all
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, answerDiscover(DISCOVER_RESULT))
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    // When the local client opens with the handshake its era still expects
+    transportToClient.onmessage?.(INITIALIZE as any)
+
+    // Then it is answered without the handshake ever reaching the server
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    expect(clientSent[0]).toMatchObject({
+      id: 'init-1',
+      result: { protocolVersion: '2025-11-25', capabilities: { tools: {} } },
+    })
+    expect(serverSent.filter((message) => message.method === 'initialize')).toHaveLength(0)
+
+    // And the header names the revision every request body will, or the server answers -32020
+    expect(transportToServer.setProtocolVersion).toHaveBeenCalledWith('2026-07-28')
+  })
+
+  it('Scenario: Every request after the handshake carries the metadata the server requires', async () => {
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, answerDiscover(DISCOVER_RESULT))
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'search' } } as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'tools/call')).toHaveLength(1))
+    const call = serverSent.find((message) => message.method === 'tools/call')
+    expect(call.params._meta).toMatchObject({
+      'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+      'io.modelcontextprotocol/clientCapabilities': { roots: {} },
+    })
+    // The name the proxy stamps into clientInfo is the one it already annotates for legacy servers
+    expect(call.params._meta['io.modelcontextprotocol/clientInfo'].name).toContain('desktop-host')
+  })
+
+  it('Scenario: Requests sent before the probe answers still go out written correctly', async () => {
+    // The client does not wait for the handshake before queueing work, and a request written in the
+    // wrong era is the failure this whole feature exists to prevent
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    let releaseProbe: (() => void) | undefined
+    const transportToServer: any = {
+      send: vi.fn(async (message: any) => {
+        serverSent.push(message)
+        if (message.method === 'server/discover') {
+          releaseProbe = () => transportToServer.onmessage?.({ jsonrpc: '2.0', id: message.id, result: DISCOVER_RESULT })
+        }
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      setProtocolVersion: vi.fn(),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    }
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(releaseProbe).toBeDefined())
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'list-1', params: {} } as any)
+
+    // Nothing goes out while the era is still unknown
+    expect(serverSent.filter((message) => message.method === 'tools/list')).toHaveLength(0)
+
+    releaseProbe!()
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'tools/list')).toHaveLength(1))
+    const list = serverSent.find((message) => message.method === 'tools/list')
+    expect(list.params._meta['io.modelcontextprotocol/protocolVersion']).toBe('2026-07-28')
+  })
+
+  it('Scenario: A server that never heard of server/discover gets the handshake it was always sent', async () => {
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) =>
+      message.method === 'server/discover'
+        ? { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } }
+        : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'initialize')).toHaveLength(1))
+    // Forwarded untouched: no `_meta`, and nothing answered on the client's behalf
+    expect(serverSent.find((message) => message.method === 'initialize').params._meta).toBeUndefined()
+    expect(clientSent).toHaveLength(0)
+  })
+
+  it('Scenario: Left alone entirely unless asked for, because every server today is a legacy one', async () => {
+    const serverSent: any[] = []
+    const transportToClient = clientTransport([])
+    const transportToServer = serverTransport(serverSent, answerDiscover(DISCOVER_RESULT))
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [] })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'initialize')).toHaveLength(1))
+    expect(serverSent.filter((message) => message.method === 'server/discover')).toHaveLength(0)
+  })
+
+  it('Scenario: The notification that closed the old handshake is not put on the wire', async () => {
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, answerDiscover(DISCOVER_RESULT))
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/initialized' } as any)
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'list-1', params: {} } as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'tools/list')).toHaveLength(1))
+    expect(serverSent.filter((message) => message.method === 'notifications/initialized')).toHaveLength(0)
+  })
+
+  it('Scenario: A liveness check is answered here, because the modern era does not define one', async () => {
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, answerDiscover(DISCOVER_RESULT))
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'ping', id: 'ping-1' } as any)
+
+    await vi.waitFor(() => expect(clientSent).toHaveLength(2))
+    expect(clientSent[1]).toEqual({ jsonrpc: '2.0', id: 'ping-1', result: {} })
+    expect(serverSent.filter((message) => message.method === 'ping')).toHaveLength(0)
+  })
+
+  it('Scenario: A modern result is handed over in terms the client understands', async () => {
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: DISCOVER_RESULT }
+      if (message.method === 'tools/list') {
+        return { jsonrpc: '2.0', id: message.id, result: { resultType: 'complete', tools: [{ name: 'search' }] } }
+      }
+      return undefined
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'list-1', params: {} } as any)
+
+    await vi.waitFor(() => expect(clientSent).toHaveLength(2))
+    expect(clientSent[1].result).toEqual({ tools: [{ name: 'search' }] })
+  })
+
+  it('Scenario: A server that speaks only revisions this proxy does not is reported, not silently failed', async () => {
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], answerDiscover({ supportedVersions: ['2099-01-01'], capabilities: {} }))
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    expect(clientSent[0].error.message).toContain('2099-01-01')
+  })
+})
+
 describe('Feature: Merging headers for the SSE request', () => {
   it('Scenario: Keep the headers the SDK set, whichever Headers class built them', () => {
     // Given headers from the SDK, which builds them with the global class rather than undici's

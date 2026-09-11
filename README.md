@@ -354,6 +354,44 @@ npx mcp-remote https://example.remote/server --transport sse-only
 - `http-only`: Only uses HTTP transport, fails if the server doesn't support it
 - `sse-only`: Only uses SSE transport, fails if the server doesn't support it
 
+### Protocol Eras (2026-07-28 servers)
+
+The `2026-07-28` revision of MCP retired the `initialize` handshake and the session behind it. A
+server that implements it serves stateless requests that each carry their own protocol version and
+capabilities, and advertises itself through `server/discover` instead of answering a handshake.
+
+Most desktop hosts still speak the `2025-11-25` era. The specification's compatibility matrix puts
+that pair — legacy client, modern server — in the one cell that simply fails, because a legacy client
+has no way to fall forward. The fix it names is a *dual-era client*, which is what `mcp-remote`
+becomes with `--protocol auto`:
+
+```bash
+npx mcp-remote https://example.remote/mcp --protocol auto
+```
+
+**Available modes:**
+
+- `legacy` (default): sends the client's `initialize` straight through, exactly as every earlier
+  release did. Nothing is probed.
+- `auto`: spends one `server/discover` on the first handshake. If a `2026-07-28` server answers,
+  `mcp-remote` answers the local client's handshake itself and rewrites every later request into the
+  modern era — per-request `_meta`, matching `MCP-Protocol-Version` header. If anything else answers,
+  the handshake goes out untouched and nothing changes.
+
+It is off by default because every server in the wild today is a legacy one, and the probe is a round
+trip those connections do not need.
+
+**Not yet bridged.** Two parts of the modern era have no `2025-11-25` equivalent, and a session that
+needs them will not work through the bridge:
+
+- Change notifications. The modern era replaces unsolicited `notifications/tools/list_changed` and
+  `resources/updated` with a `subscriptions/listen` stream, which is not yet translated back.
+- Multi-round-trip requests. A server that answers with `input_required` — asking for sampling,
+  elicitation or roots mid-request — is reported to the local client as an error, because a client
+  from before MRTR has nowhere to put the question.
+
+Tool listing and tool calls, which is what most remote servers expose, work.
+
 ### Static OAuth Client Metadata
 
 MCP Remote supports providing static OAuth client metadata instead of using the mcp-remote defaults.
