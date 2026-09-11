@@ -64,8 +64,8 @@ importers:
         specifier: ^3.2.3
         version: 3.2.3(@types/node@22.13.10)(jiti@2.7.0)(tsx@4.19.3)(yaml@2.9.0)
       zod:
-        specifier: ^4.0.0
-        version: 4.1.13
+        specifier: ^4.2.0
+        version: 4.4.3
 
 packages:
 
@@ -2879,9 +2879,6 @@ packages:
     resolution: {integrity: sha512-xYqdZFUK/VYazNl/oCDYN+3WloWQwMfZxBoiNt6qNyk+xfOdi598muWE42rNZFp1kNOiqW936q5RhUdnpqElSg==}
     engines: {node: '>=18'}
 
-  zod@4.1.13:
-    resolution: {integrity: sha512-AvvthqfqrAhNH9dnfmrfKzX5upOdjUVJYFqNSlkmGf64gRaTzlPwz99IHYnVs28qYAybvAlBV+H7pn0saFY4Ig==}
-
   zod@4.4.3:
     resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
 
@@ -5429,7 +5426,5 @@ snapshots:
       yargs-parser: 22.0.0
 
   yoctocolors@2.2.0: {}
-
-  zod@4.1.13: {}
 
   zod@4.4.3: {}
