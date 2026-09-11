@@ -3519,6 +3519,136 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     expect(serverSent.find((message) => message.method === 'notifications/cancelled').params.requestId).toBe(retryId)
   })
 
+  it('Scenario: Every later resource subscription is honoured, not just the first', async () => {
+    // The hook that reopens the stream used to be handed to the idle wait, which overwrote it and
+    // never gave it back - so a second subscribe went nowhere
+    const serverSent: any[] = []
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) =>
+      message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ resources: {} }) } : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'resources/subscribe', id: 's1', params: { uri: 'file:///a' } } as any)
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'subscriptions/listen')).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'resources/subscribe', id: 's2', params: { uri: 'file:///b' } } as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'subscriptions/listen').length).toBeGreaterThan(1), {
+      timeout: 10000,
+    })
+    const listens = serverSent.filter((m) => m.method === 'subscriptions/listen')
+    const latest = listens[listens.length - 1]
+    expect(latest.params.notifications.resourceSubscriptions).toEqual(['file:///a', 'file:///b'])
+  }, 20000)
+
+  it('Scenario: The stream being replaced is cancelled, not left running', async () => {
+    // Abandoned streams keep delivering, so the client would see every change once per filter it
+    // had ever asked for
+    const serverSent: any[] = []
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) =>
+      message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ resources: {} }) } : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'resources/subscribe', id: 's1', params: { uri: 'file:///a' } } as any)
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'subscriptions/listen')).toHaveLength(1))
+    const first = serverSent.find((m) => m.method === 'subscriptions/listen')
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'resources/subscribe', id: 's2', params: { uri: 'file:///b' } } as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'notifications/cancelled')).toHaveLength(1))
+    expect(serverSent.find((m) => m.method === 'notifications/cancelled').params.requestId).toBe(first.id)
+  }, 20000)
+
+  it('Scenario: A refused resource subscription does not cost the client the rest of its notifications', async () => {
+    // One unsupported resource used to end the loop outright, so tools/list_changed stopped too
+    const serverSent: any[] = []
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') {
+        return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: { listChanged: true }, resources: {} }) }
+      }
+      if (message.method !== 'subscriptions/listen') return undefined
+      if (message.params.notifications.resourceSubscriptions) {
+        return { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'no resource subscriptions here' } }
+      }
+      return undefined
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'subscriptions/listen')).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'resources/subscribe', id: 's1', params: { uri: 'file:///a' } } as any)
+
+    // It drops the resources and keeps listening for what the server will serve
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'subscriptions/listen').length).toBeGreaterThanOrEqual(3), {
+      timeout: 10000,
+    })
+    const listens = serverSent.filter((m) => m.method === 'subscriptions/listen')
+    const latest = listens[listens.length - 1]
+    expect(latest.params.notifications).toEqual({ toolsListChanged: true })
+  }, 20000)
+
+  it('Scenario: A cancelled exchange is answered once, by the cancellation and not by the server', async () => {
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call' || message.params.inputResponses) return undefined
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'x' } } as any)
+
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.method === 'sampling/createMessage')).toHaveLength(1))
+    const question = clientSent.find((m) => m.method === 'sampling/createMessage')
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant' } })
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'tools/call')).toHaveLength(2))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'call-1' } } as any)
+    const retryId = serverSent.filter((m) => m.method === 'tools/call')[1].id
+    transportToServer.onmessage?.({ jsonrpc: '2.0', id: retryId, result: { resultType: 'complete', content: [] } })
+
+    await new Promise((settle) => setTimeout(settle, 100))
+    expect(clientSent.filter((m) => m.id === 'call-1')).toHaveLength(0)
+  })
+
+  it('Scenario: A server request that borrows this proxy own id namespace is refused, not forwarded', async () => {
+    // Forwarded, the client's answer would be consumed here as one of ours and the server would
+    // wait forever
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, () => undefined)
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [] })
+
+    transportToServer.onmessage?.({ jsonrpc: '2.0', method: 'sampling/createMessage', id: 'mcp-remote-keepalive-1', params: {} })
+
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.error)).toHaveLength(1))
+    expect(serverSent.find((m) => m.error).error.code).toBe(-32600)
+    expect(clientSent.filter((m) => m.method === 'sampling/createMessage')).toHaveLength(0)
+  })
+
   it('Scenario: A question this proxy cannot put to a 2025-era client is reported, not dropped', async () => {
     const clientSent: any[] = []
     const transportToClient = clientTransport(clientSent)

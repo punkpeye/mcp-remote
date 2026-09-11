@@ -549,8 +549,14 @@ export function mcpProxy({
   let requestedLogLevel: string | undefined
   /** Reopens the change-notification stream against a filter that has changed. */
   let refreshSubscription: (() => void) | undefined
+  /** The stream currently open, if any, so a filter change can end it rather than leave it running. */
+  let activeStream: { reopen: () => void } | undefined
+  /** Wakes a loop that is idling because there is nothing to listen for yet. */
+  let wakeIdleWait: (() => void) | undefined
   /** The remote-side id a client request is currently being retried under, for cancellation. */
   const modernRetryIds = new Map<string | number, string>()
+  /** Exchanges the client has cancelled, whose eventual answer is no longer wanted. */
+  const cancelledExchanges = new Set<string | number>()
   let discoverSeq = 0
   const pendingDiscover = new Map<string, (message: Message) => void>()
   /**
@@ -724,6 +730,21 @@ export function mcpProxy({
     //
     // Only what is still outstanding is claimed. An id we have already settled belongs to whoever
     // sent it next, and client ids are kept out of this namespace on the way past instead.
+    // A server *request* in this proxy's id namespace would collide with one of ours: forwarding it
+    // leaves the client's answer to be consumed here as if it were ours, and the server waiting
+    // forever. Refused at the boundary instead, the way a client request in it is.
+    if (isOwnId(incomingId) && (_message as any).method !== undefined) {
+      log(`Refusing a server request whose id is reserved by this proxy: ${incomingId}`)
+      transportToServer
+        .send({
+          jsonrpc: '2.0',
+          id: incomingId,
+          error: { code: -32600, message: `mcp-remote reserves request ids beginning with "${OWN_ID_PREFIX}"` },
+        } as Message)
+        .catch(onServerError)
+      return
+    }
+
     if (typeof incomingId === 'string') {
       if (pendingPings.delete(incomingId)) return
 
@@ -761,7 +782,13 @@ export function mcpProxy({
         log('[Remote→Local]', `${incomingId} (asking for more input)`)
         driveInputRequired(original, (_message as any).result, era.version).catch((error: Error) => {
           onServerError(error)
-          replyWithError(original, error)
+          // Through `answerClient`, so the exchange stops being one a dropped session would fail a
+          // second time - `replyWithError` answers but leaves it on the books
+          answerClient({
+            jsonrpc: '2.0',
+            id: original.id,
+            error: { code: -32001, message: `mcp-remote: ${error.message}` },
+          } as Message)
         })
         // The transformer is still holding this request against a response that now arrives from
         // `answerClient` rather than from here
@@ -1001,7 +1028,40 @@ export function mcpProxy({
    * @param timeoutMs How long to wait before giving up on an answer
    * @returns The response the remote sent
    */
-  async function askRemote(build: (id: string) => Message, timeoutMs: number): Promise<Message> {
+  /**
+   * {@link askRemote}, with a handle to give up on the answer.
+   *
+   * Giving up has to reach the server, not just this process: a `subscriptions/listen` that is
+   * abandoned rather than cancelled stays open and goes on delivering, so a client that subscribes
+   * three times would see every change three times over, from three streams nobody is tracking.
+   *
+   * @returns The answer, and a `cancel` that ends the request at both ends
+   */
+  function askRemoteCancellable(build: (id: string) => Message, timeoutMs: number): { answer: Promise<Message>; cancel: () => void } {
+    let cancel = () => {}
+
+    const answer = new Promise<Message>((resolve, reject) => {
+      const cancelled = new Promise<never>((_, rejectCancelled) => {
+        cancel = () => {
+          rejectCancelled(new Error('the request was cancelled'))
+        }
+      })
+
+      askRemote(build, timeoutMs, (id) => {
+        // Told to stop, so the server is told too - and its pending entry released here
+        void cancelled.catch(() => {
+          pendingOwnRequests.delete(id)
+          transportToServer.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id } }).catch(() => {})
+        })
+      }).then(resolve, reject)
+
+      cancelled.catch(reject)
+    })
+
+    return { answer, cancel }
+  }
+
+  async function askRemote(build: (id: string) => Message, timeoutMs: number, onSent?: (id: string) => void): Promise<Message> {
     const id = `mcp-remote-own-${++ownRequestSeq}`
 
     // The same barrier `sendToServer` waits on. Without it a retry leg is POSTed onto the session
@@ -1022,6 +1082,8 @@ export function mcpProxy({
         clearTimeout(timer)
         resolve(message)
       })
+
+      onSent?.(id)
 
       transportToServer.send(build(id)).catch((error) => {
         clearTimeout(timer)
@@ -1074,17 +1136,26 @@ export function mcpProxy({
    * failing to open it costs the client change notifications, not its session.
    */
   async function openChangeSubscription(version: string, capabilities: Record<string, unknown> | undefined) {
-    // A `resources/subscribe` after the stream is open changes what should be on it. Reopening is
-    // the only way to say so, because the filter travels with the request that opened it.
-    let reopenNow: (() => void) | undefined
-    refreshSubscription = () => reopenNow?.()
+    // Installed once, and never reassigned: an earlier version handed this to a helper that
+    // overwrote it and never gave it back, so every subscription after the first was dropped on the
+    // floor. Both things it has to do - wake an idle wait, end a stream that is now listening for
+    // the wrong thing - are dispatched from here.
+    refreshSubscription = () => {
+      wakeIdleWait?.()
+      activeStream?.reopen()
+    }
+
+    // Dropped after a refusal that named them, so one unsupported resource cannot cost the client
+    // the tools and prompts notifications it was already getting.
+    let includeResourceSubscriptions = true
 
     // A stream is not a session: it ends on a server restart, a load balancer's idle timeout, or a
     // network flake, and the client would go on believing nothing has changed since. Reopening is
     // the only thing that turns that back into a working subscription, because nothing below this
     // notices it stopped.
     for (let attempts = 0; attempts < SUBSCRIPTION_REOPEN_LIMIT; attempts++) {
-      const notifications = subscriptionFilterFor(capabilities, [...subscribedResources])
+      const notifications = subscriptionFilterFor(capabilities, includeResourceSubscriptions ? [...subscribedResources] : [])
+
       if (!notifications) {
         // Nothing to listen for yet. A later `resources/subscribe` is what gives this a reason to
         // exist, so this waits for one rather than giving up on the session.
@@ -1095,27 +1166,36 @@ export function mcpProxy({
       }
 
       const openedAt = Date.now()
+      let reopening = false
 
       try {
         debugLog('Subscribing to change notifications on the client behalf', { notifications })
         // Resolves only when the stream ends, so this bounds a session's worth of notifications
         // rather than a request
-        const changed = new Promise<Message>((resolve) => {
-          reopenNow = () => resolve({ jsonrpc: '2.0', result: { reopen: true } } as Message)
-        })
-        const response = await Promise.race([
-          askRemote((id) => subscriptionsListenRequest(id, clientIdentity, version, notifications) as Message, SUBSCRIPTION_LIFETIME_MS),
-          changed,
-        ])
-        reopenNow = undefined
-
-        if ((response.result as { reopen?: boolean } | undefined)?.reopen) {
-          debugLog('Reopening the change-notification stream against a filter the client changed')
-          attempts = -1
-          continue
+        const stream = askRemoteCancellable(
+          (id: string) => subscriptionsListenRequest(id, clientIdentity, version, notifications) as Message,
+          SUBSCRIPTION_LIFETIME_MS,
+        )
+        activeStream = {
+          reopen: () => {
+            reopening = true
+            // Cancelled rather than abandoned: a stream left open goes on delivering, so the client
+            // would see every change once per filter it has ever asked for
+            stream.cancel()
+          },
         }
 
+        const response = await stream.answer
+
         if (response.error) {
+          if (includeResourceSubscriptions && subscribedResources.size > 0) {
+            // The filter named resources; the rest of it may still be perfectly acceptable
+            log(`The remote server refused a subscription naming resources; listening for the rest: ${JSON.stringify(response.error)}`)
+            includeResourceSubscriptions = false
+            attempts = -1
+            continue
+          }
+
           // A refusal is a decision, not a flake; reopening would only ask again and be told again
           log(`The remote server refused the change-notification subscription: ${JSON.stringify(response.error)}`)
           return
@@ -1123,7 +1203,15 @@ export function mcpProxy({
 
         debugLog('The change-notification stream ended', { heldForMs: Date.now() - openedAt })
       } catch (error) {
+        if (reopening) {
+          debugLog('Reopening the change-notification stream against a filter the client changed')
+          attempts = -1
+          if (transportToClientClosed || transportToServerClosed) return
+          continue
+        }
         debugLog('The change-notification stream failed', { heldForMs: Date.now() - openedAt, error })
+      } finally {
+        activeStream = undefined
       }
 
       // A stream that stayed open did its job, so reopening it is ordinary maintenance and the
@@ -1151,14 +1239,16 @@ export function mcpProxy({
       const timer = setInterval(() => {
         if (transportToClientClosed || transportToServerClosed) {
           clearInterval(timer)
-          refreshSubscription = undefined
+          wakeIdleWait = undefined
           resolve(false)
         }
       }, SUBSCRIPTION_REOPEN_DELAY_MS)
       timer.unref?.()
 
-      refreshSubscription = () => {
+      // Its own hook, so waking the wait cannot cost the loop the handle it reopens streams with
+      wakeIdleWait = () => {
         clearInterval(timer)
+        wakeIdleWait = undefined
         resolve(true)
       }
     })
@@ -1192,6 +1282,14 @@ export function mcpProxy({
     if (message.id !== undefined && message.id !== null) {
       pendingRequests.delete(message.id)
       modernRetryIds.delete(message.id)
+
+      // Cancelled, or already answered by whatever failed the request first. Either way the client
+      // is not waiting on this any more, and a second response for one id is what makes its SDK
+      // complain about an unknown message id.
+      if (cancelledExchanges.delete(message.id)) {
+        debugLog('Dropping an answer to an exchange the client had already given up on', { id: message.id })
+        return
+      }
     }
     transportToClient.send(messageTransformer.interceptResponse(message)).catch(onClientError)
   }
@@ -1386,6 +1484,10 @@ export function mcpProxy({
         const retryId = modernRetryIds.get(message.params?.requestId)
         if (retryId !== undefined) {
           debugLog('Re-addressing a cancellation to the leg the server is actually running', { retryId })
+          // The exchange is no longer owed an answer, and one that arrives anyway must not be
+          // delivered to a client that has already moved on
+          cancelledExchanges.add(message.params.requestId)
+          pendingRequests.delete(message.params.requestId)
           void sendToServer({ ...message, params: { ...message.params, requestId: retryId } })
           return
         }
@@ -1592,6 +1694,7 @@ export function mcpProxy({
       // Answered now, so there is nothing left to retry a multi-round-trip exchange for
       modernOriginals.delete(id)
       modernRetryIds.delete(id)
+      cancelledExchanges.delete(id)
     }
     pendingRequests.clear()
   }
