@@ -3847,6 +3847,127 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     expect(clientSent.filter((m) => m.id === 'call-1')).toHaveLength(0)
   }, 20000)
 
+  it('Scenario: A stranded exchange does not free the request that reused its id', async () => {
+    // Releasing the hold unconditionally frees whatever is held under that id - which may be the
+    // new request - and its answer then pairs with nothing and reaches the client untransformed,
+    // carrying the tools --ignore-tool was meant to hide
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    let firstAsked = false
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/list') return undefined
+
+      // The stranded exchange's retry, which is what carries it as far as answering
+      if (message.params.inputResponses) {
+        return { jsonrpc: '2.0', id: message.id, result: { resultType: 'complete', tools: [{ name: 'stale' }] } }
+      }
+      // Only the first request opens an exchange; the second is answered by hand below
+      if (firstAsked) return undefined
+      firstAsked = true
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: ['secret'], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    // An exchange starts under id X, then is abandoned
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'X', params: {} } as any)
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.method === 'sampling/createMessage')).toHaveLength(1))
+    const question = clientSent.find((m) => m.method === 'sampling/createMessage')
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'X' } } as any)
+
+    // The client reuses X for a fresh request, which the server has not answered yet
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'X', params: {} } as any)
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'tools/list' && !m.params.inputResponses)).toHaveLength(2))
+
+    // The stranded exchange now runs all the way to an answer, which is dropped - and must not take
+    // the new request's hold with it
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant' } })
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.params?.inputResponses)).toHaveLength(1))
+    await new Promise((settle) => setTimeout(settle, 100))
+    expect(clientSent.filter((m) => m.id === 'X')).toHaveLength(0)
+
+    // Now the server answers the request that actually owns X
+    transportToServer.onmessage?.({
+      jsonrpc: '2.0',
+      id: 'X',
+      result: { resultType: 'complete', tools: [{ name: 'keep' }, { name: 'secret' }] },
+    })
+
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.id === 'X')).toHaveLength(1))
+    const answer = clientSent.find((m) => m.id === 'X')
+    expect(answer.result.tools).toEqual([{ name: 'keep' }])
+    expect(answer.result).not.toHaveProperty('resultType')
+  }, 20000)
+
+  it('Scenario: A request for more input on an exchange already over is not answered twice', async () => {
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], (message: any) =>
+      message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) } : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'x' } } as any)
+    ;(transportToServer as any).onStreamReconnect?.()
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.id === 'call-1')).toHaveLength(1))
+
+    // The server's answer arrives after the session already failed the request
+    transportToServer.onmessage?.({ jsonrpc: '2.0', id: 'call-1', result: { resultType: 'input_required', inputRequests: {} } })
+
+    await new Promise((settle) => setTimeout(settle, 100))
+    expect(clientSent.filter((m) => m.id === 'call-1')).toHaveLength(1)
+  }, 20000)
+
+  it('Scenario: A cancellation does not leave the retry mapping behind for the next request', async () => {
+    // Left behind, a later cancellation under the same client id names the dead leg of the
+    // exchange before it
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call' || message.params.inputResponses) return undefined
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    // A first exchange gets as far as a retry leg, then is cancelled
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'Y', params: { name: 'x' } } as any)
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.method === 'sampling/createMessage')).toHaveLength(1))
+    const q1 = clientSent.find((m) => m.method === 'sampling/createMessage')
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: q1.id, result: { role: 'assistant' } })
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.params?.inputResponses)).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'Y' } } as any)
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.method === 'notifications/cancelled')).toHaveLength(1))
+
+    // A new exchange under the same id, cancelled before any leg exists
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'Y', params: { name: 'x' } } as any)
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.method === 'sampling/createMessage')).toHaveLength(2))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'Y' } } as any)
+
+    // Nothing further goes to the server: there is no leg of this exchange to cancel
+    await new Promise((settle) => setTimeout(settle, 100))
+    expect(serverSent.filter((m) => m.method === 'notifications/cancelled')).toHaveLength(1)
+  }, 20000)
+
   it('Scenario: A question this proxy cannot put to a 2025-era client is reported, not dropped', async () => {
     const clientSent: any[] = []
     const transportToClient = clientTransport(clientSent)
@@ -3867,7 +3988,9 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'search' } } as any)
 
     await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'call-1')).toHaveLength(1))
-    expect(clientSent.find((message) => message.id === 'call-1').error.message).toContain('something/new')
+    // The specific refusal, not merely a message that happens to name the method - the capability
+    // check produces one of those too, so asserting the method name alone proves nothing
+    expect(clientSent.find((message) => message.id === 'call-1').error.message).toContain('cannot put to a 2025-era client')
   })
 })
 

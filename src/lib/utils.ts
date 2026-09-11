@@ -479,9 +479,30 @@ function createMessageTransformer({
     return applyTransform(() => transformResponseFunction(originalRequest, message) ?? message, message)
   }
 
+  /**
+   * Releases the request held against `id`, for an answer that never came back through here.
+   *
+   * Several answers are produced by the proxy itself - a locally answered method, a blocked tool
+   * call, a request a dropped session failed - and none of them pass through
+   * {@link interceptResponse}, so without this the request stays held for the life of the process.
+   *
+   * `only` guards against freeing the wrong one: an id is the client's to reuse, so by the time a
+   * stale exchange gets here the entry may belong to the request that replaced it. Releasing that
+   * would leave the new answer with nothing to pair against, and it would reach the client
+   * untransformed - with, for instance, the tools `--ignore-tool` was meant to hide.
+   *
+   * @param id The request id to release
+   * @param only Release only if this is the request being held
+   */
+  const release = (id: string | number, only?: Message) => {
+    if (only !== undefined && pendingRequests.get(id) !== only) return
+    pendingRequests.delete(id)
+  }
+
   return {
     interceptRequest,
     interceptResponse,
+    release,
   }
 }
 
@@ -694,6 +715,10 @@ export function mcpProxy({
 
     // If interceptor returns MESSAGE_BLOCKED, don't forward the message
     if (isMessageBlocked(message)) {
+      // Answered without ever reaching the server, so nothing will pair a response with it and
+      // release the hold the transformer took on the way in
+      const blockedId = (_message as any).id
+      if (blockedId !== undefined && blockedId !== null) messageTransformer.release(blockedId)
       return
     }
 
@@ -799,7 +824,15 @@ export function mcpProxy({
     // request it sent while the questions are put to it separately, and is answered once.
     if (era?.era === 'modern' && incomingId !== undefined && incomingId !== null && isInputRequiredResult((_message as any).result)) {
       const original = modernOriginals.get(incomingId)
-      if (original) {
+      if (!original) {
+        // Its request was already answered - by a dropped session, or a cancellation - so there is
+        // nothing left to retry and nothing left to answer. Translating it would send the client a
+        // second response for an id it has already been given one for.
+        debugLog('Discarding a request for more input on an exchange that is already over', { id: incomingId })
+        return
+      }
+
+      {
         modernOriginals.delete(incomingId)
         // Deliberately left in `pendingRequests`: the exchange is still owed an answer, and a
         // dropped session has to be able to fail it rather than leave the client waiting out the
@@ -814,6 +847,7 @@ export function mcpProxy({
           answerClient(
             { jsonrpc: '2.0', id: original.id, error: { code: -32001, message: `mcp-remote: ${error.message}` } } as Message,
             exchange,
+            original,
           )
         })
         // The transformer is still holding this request against a response that now arrives from
@@ -1316,16 +1350,17 @@ export function mcpProxy({
    * multi-round-trip exchange would hand back the tools the user asked to hide. Which tools those
    * are is exactly what the remote server would have to control to arrange it.
    */
-  function answerClient(message: Message, exchange?: number) {
+  function answerClient(message: Message, exchange?: number, original?: Message) {
     if (message.id !== undefined && message.id !== null) {
       // Only the exchange still holding this id may answer it. One that was cancelled, or failed by
       // a dropped session, or superseded by the client reusing the id, finds its token gone - and
       // a second response for one id is what makes a client's SDK complain about an unknown id.
       if (exchange !== undefined && liveExchanges.get(message.id) !== exchange) {
         debugLog('Dropping an answer from an exchange that no longer speaks for this request', { id: message.id, exchange })
-        // Called for its effect, not its result: it is what releases the transformer's hold on the
-        // original request, which would otherwise be kept for the life of the process
-        messageTransformer.interceptResponse(message)
+        // Releases this exchange's own hold and nobody else's. Freeing the entry unconditionally
+        // would free the request that reused this id, whose answer would then pair with nothing and
+        // reach the client untransformed.
+        if (original) messageTransformer.release(message.id, original)
         return
       }
 
@@ -1386,14 +1421,14 @@ export function mcpProxy({
       }, MULTI_ROUND_TRIP_LEG_TIMEOUT_MS)
 
       if (reply.error) {
-        answerClient({ jsonrpc: '2.0', id: original.id, error: reply.error } as Message, exchange)
+        answerClient({ jsonrpc: '2.0', id: original.id, error: reply.error } as Message, exchange, original)
         return
       }
 
       if (!isInputRequiredResult(reply.result)) {
         const translated = translateModernResult(reply.result)
         const answer = 'error' in translated ? { error: translated.error } : { result: translated.result }
-        answerClient({ jsonrpc: '2.0', id: original.id, ...answer } as Message, exchange)
+        answerClient({ jsonrpc: '2.0', id: original.id, ...answer } as Message, exchange, original)
         return
       }
 
@@ -1534,6 +1569,9 @@ export function mcpProxy({
         // The server, meanwhile, knows the exchange by the id this proxy minted for the retry leg,
         // so a notification naming the client's id would cancel nothing
         const retryId = modernRetryIds.get(cancelledId)
+        // Read first, then cleared: left behind it would outlive the exchange, and a later
+        // cancellation under the same client id would name this one's long-dead leg
+        modernRetryIds.delete(cancelledId)
         if (retryId !== undefined) {
           debugLog('Re-addressing a cancellation to the leg the server is actually running', { retryId })
           void sendToServer({ ...message, params: { ...message.params, requestId: retryId } })
@@ -1563,6 +1601,7 @@ export function mcpProxy({
         // there is nothing to answer and the server has no such method to forward it to
         if (message.id !== undefined && message.id !== null) {
           debugLog('Answering locally a method the modern era does not define', { method: message.method })
+          messageTransformer.release(message.id)
           transportToClient.send({ jsonrpc: '2.0', id: message.id, result: answer }).catch(onClientError)
         } else {
           debugLog('Dropping a notification for a method the modern era does not define', { method: message.method })
@@ -1645,7 +1684,13 @@ export function mcpProxy({
         : message
 
     // Kept so that a server answering `input_required` can be retried with what the client sent
-    if (era?.era === 'modern' && awaitsAnswer) modernOriginals.set(message.id!, message)
+    if (era?.era === 'modern' && awaitsAnswer) {
+      // The id is the client's to reuse, and doing so ends whatever was running under it: the old
+      // exchange loses its claim here rather than answering the request that replaced it
+      liveExchanges.delete(message.id!)
+      modernRetryIds.delete(message.id!)
+      modernOriginals.set(message.id!, message)
+    }
 
     try {
       await transportToServer.send(outgoing)
@@ -1742,6 +1787,7 @@ export function mcpProxy({
 
     debugLog('Failing requests the dropped session can no longer answer', { ids: [...pendingRequests] })
     for (const id of pendingRequests) {
+      messageTransformer.release(id)
       transportToClient.send({ jsonrpc: '2.0', id, error: { code: -32001, message: `mcp-remote: ${reason}` } }).catch(onClientError)
       // Answered now, so there is nothing left to retry a multi-round-trip exchange for
       modernOriginals.delete(id)
@@ -1783,6 +1829,8 @@ export function mcpProxy({
     if (message.method === undefined || message.id === undefined || message.id === null) {
       return
     }
+    // Answered here rather than by the server, so the transformer's hold is released here too
+    messageTransformer.release(message.id, message)
     transportToClient
       .send({
         jsonrpc: '2.0',
