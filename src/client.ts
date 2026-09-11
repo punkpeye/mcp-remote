@@ -10,8 +10,7 @@
  */
 
 import { EventEmitter } from 'events'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { ListResourcesResultSchema, ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
+import { Client } from '@modelcontextprotocol/client'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import {
   parseCommandLineArgs,
@@ -166,7 +165,7 @@ async function runClient(
     try {
       // Request tools list
       log('Requesting tools list...')
-      const tools = await client.request({ method: 'tools/list' }, ListToolsResultSchema)
+      const tools = await client.request({ method: 'tools/list' })
       log('Tools:', JSON.stringify(tools, null, 2))
     } catch (e) {
       log('Error requesting tools list:', e)
@@ -175,7 +174,7 @@ async function runClient(
     try {
       // Request resources list
       log('Requesting resource list...')
-      const resources = await client.request({ method: 'resources/list' }, ListResourcesResultSchema)
+      const resources = await client.request({ method: 'resources/list' })
       log('Resources:', JSON.stringify(resources, null, 2))
     } catch (e) {
       log('Error requesting resources list:', e)

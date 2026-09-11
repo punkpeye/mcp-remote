@@ -1,5 +1,6 @@
-import { selectClientAuthMethod } from '@modelcontextprotocol/sdk/client/auth.js'
-import { OAuthTokens, OAuthTokensSchema, type OAuthClientInformationMixed } from '@modelcontextprotocol/sdk/shared/auth.js'
+import { OAuthTokensSchema } from '@modelcontextprotocol/core'
+import { selectClientAuthMethod } from '@modelcontextprotocol/client'
+import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/client'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 import { log, debugLog } from './utils'
 

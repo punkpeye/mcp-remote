@@ -10,8 +10,8 @@
  */
 
 import { EventEmitter } from 'events'
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import type { Transport } from '@modelcontextprotocol/client'
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio'
 import {
   connectToRemoteServer,
   log,
@@ -157,10 +157,10 @@ async function runProxy(
        * Discards a token the server refused straight after issuing it.
        *
        * Clearing it is what turns the next attempt back into an ordinary 401, which `reauthorize`
-       * below can actually answer. Left alone, the SDK keeps presenting the same dead credential
-       * and refuses to ask for another, so the failure repeats on every run.
+       * below can actually answer. Left alone, the same dead credential is read back from disk and
+       * presented again, so the failure repeats on every run.
        */
-      forgetRejectedAuthorization: () => forgetRejectedAuthorization(authProvider, remoteTransport),
+      forgetRejectedAuthorization: () => forgetRejectedAuthorization(authProvider),
 
       /**
        * Finishes a sign-in the remote server asked for mid-session.

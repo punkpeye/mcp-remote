@@ -6,8 +6,7 @@ import type { OAuthProviderOptions } from './types'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 import { log } from './utils'
 import { authorizeWithDeviceCode, DEVICE_CODE_GRANT_TYPE } from './device-authorization'
-import { auth, refreshAuthorization } from '@modelcontextprotocol/sdk/client/auth.js'
-import { InvalidClientError, UnauthorizedClientError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
+import { auth, OAuthError, refreshAuthorization } from '@modelcontextprotocol/client'
 
 vi.mock('./mcp-auth-config')
 vi.mock('./authorization-server-metadata', () => ({
@@ -28,7 +27,7 @@ vi.mock('./device-authorization', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   authorizeWithDeviceCode: vi.fn(),
 }))
-vi.mock('@modelcontextprotocol/sdk/client/auth.js', async (importOriginal) => ({
+vi.mock('@modelcontextprotocol/client', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   refreshAuthorization: vi.fn(),
 }))
@@ -139,7 +138,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
       await expect(
         provider.redirectToAuthorization(new URL('https://auth.example.com/authorize?client_id=stale-client')),
-      ).rejects.toBeInstanceOf(errorCode === 'invalid_client' ? InvalidClientError : UnauthorizedClientError)
+      ).rejects.toMatchObject({ constructor: OAuthError, code: errorCode })
 
       expect(mockDeleteConfigFile).not.toHaveBeenCalled()
     })

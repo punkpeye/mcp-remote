@@ -1,20 +1,14 @@
 import { z } from 'zod'
-import {
-  OAuthClientProvider,
-  refreshAuthorization,
-  selectClientAuthMethod,
-  selectResourceURL,
-} from '@modelcontextprotocol/sdk/client/auth.js'
-import {
+import { OAuthClientInformationFullSchema, OAuthTokensSchema } from '@modelcontextprotocol/core'
+import { OAuthError, OAuthErrorCode, refreshAuthorization, selectClientAuthMethod, selectResourceURL } from '@modelcontextprotocol/client'
+import type {
   OAuthClientInformation,
   OAuthClientInformationFull,
-  OAuthClientInformationFullSchema,
   OAuthClientInformationMixed,
+  OAuthClientProvider,
   OAuthTokens,
-  OAuthTokensSchema,
-} from '@modelcontextprotocol/sdk/shared/auth.js'
+} from '@modelcontextprotocol/client'
 import { type OAuthProviderOptions, type StaticOAuthClientInformationFull, type StaticOAuthClientMetadata } from './types'
-import { InvalidClientError, UnauthorizedClientError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import {
   readJsonFile,
   writeJsonFile,
@@ -47,12 +41,28 @@ import {
  * otherwise drop `expires_at` on read, so we parse and serialize tokens with
  * this extended schema instead.
  */
-export const OAuthTokensWithExpiresAtSchema = OAuthTokensSchema.extend({
-  expires_at: z.coerce.number().optional(),
+type OAuthTokensWithExpiresAt = OAuthTokens & {
+  expires_at?: number
   /** The scope this client asked for when the token was obtained. See {@link scopeRequestChanged}. */
+  requested_scope?: string
+}
+
+/**
+ * The surface this package asks of the stored-token schema.
+ *
+ * Annotated rather than inferred because the declaration build cannot name an inferred zod type
+ * without reaching into zod's own internal paths and refuses to emit one (TS2742) - and naming the
+ * zod type itself is what sends that build out of memory.
+ */
+type TokenStoreSchema = {
+  parse(value: unknown): OAuthTokensWithExpiresAt
+  parseAsync(value: unknown): Promise<OAuthTokensWithExpiresAt>
+}
+
+export const OAuthTokensWithExpiresAtSchema: TokenStoreSchema = OAuthTokensSchema.extend({
+  expires_at: z.coerce.number().optional(),
   requested_scope: z.string().optional(),
 })
-type OAuthTokensWithExpiresAt = z.infer<typeof OAuthTokensWithExpiresAtSchema>
 
 const FALLBACK_SCOPE = 'openid email profile'
 
@@ -146,7 +156,7 @@ function jwtExpiresAt(token: string): number | undefined {
   }
 }
 
-function staleClientRegistrationError(value: unknown): InvalidClientError | UnauthorizedClientError | undefined {
+function staleClientRegistrationError(value: unknown): OAuthError | undefined {
   if (!value || typeof value !== 'object') {
     return undefined
   }
@@ -154,11 +164,11 @@ function staleClientRegistrationError(value: unknown): InvalidClientError | Unau
   const response = value as Record<string, unknown>
   const message =
     typeof response.error_description === 'string' ? response.error_description : 'Cached OAuth client registration is no longer valid'
-  if (response.error === 'invalid_client') {
-    return new InvalidClientError(message)
+  if (response.error === OAuthErrorCode.InvalidClient) {
+    return new OAuthError(OAuthErrorCode.InvalidClient, message)
   }
-  if (response.error === 'unauthorized_client') {
-    return new UnauthorizedClientError(message)
+  if (response.error === OAuthErrorCode.UnauthorizedClient) {
+    return new OAuthError(OAuthErrorCode.UnauthorizedClient, message)
   }
   return undefined
 }
@@ -565,9 +575,18 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
-    debugLog('Saving client info', { client_id: clientInformation.client_id })
+    // Saving the client we just read back is not a registration. The SDK re-saves a cached client
+    // to stamp it with the issuer that vouched for it (SEP-2352), and treating that as a fresh
+    // registration would retire the preflight in {@link preflightCachedDynamicClientRegistration} -
+    // leaving a stale cached client to fail the sign-in it exists to recover from.
+    const isRestampOfCachedClient =
+      this.clientRegistrationSource === 'cached-dynamic' && clientInformation.client_id === this._clientInfo?.client_id
+
+    debugLog('Saving client info', { client_id: clientInformation.client_id, restamp: isRestampOfCachedClient })
     this._clientInfo = clientInformation
-    this.clientRegistrationSource = 'fresh-dynamic'
+    if (!isRestampOfCachedClient) {
+      this.clientRegistrationSource = 'fresh-dynamic'
+    }
     await writeJsonFile(this.serverUrlHash, 'client_info.json', clientInformation)
   }
 

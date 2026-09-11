@@ -1,6 +1,5 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio'
+import { Client } from '@modelcontextprotocol/client'
 import { fileURLToPath } from 'url'
 import { dirname, resolve } from 'path'
 
@@ -50,7 +49,7 @@ export async function createMCPClient(serverUrl: string, args: string[] = []): P
  */
 export async function listTools(client: Client) {
   try {
-    const response = await client.request({ method: 'tools/list' }, ListToolsResultSchema)
+    const response = await client.request({ method: 'tools/list' })
     return response.tools || []
   } catch (err: any) {
     if (err.message?.includes('not supported') || err.code === -32601) {

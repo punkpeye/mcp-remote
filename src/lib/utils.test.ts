@@ -15,12 +15,17 @@ import {
 } from './utils'
 import { getConfigDir } from './mcp-auth-config'
 import { Headers as UndiciHeaders } from 'undici'
-import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
-import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
-import { parseErrorResponse } from '@modelcontextprotocol/sdk/client/auth.js'
-import { InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
+import {
+  Client,
+  OAuthError,
+  OAuthErrorCode,
+  parseErrorResponse,
+  SdkErrorCode,
+  SdkHttpError,
+  UnauthorizedError,
+} from '@modelcontextprotocol/client'
+import type { OAuthClientProvider } from '@modelcontextprotocol/client'
+import type { Transport } from '@modelcontextprotocol/client'
 import { EventEmitter } from 'events'
 import { createServer, type ServerResponse } from 'node:http'
 
@@ -1978,7 +1983,7 @@ describe('Feature: MCP Proxy', () => {
         }
         if (expireNextCall && message.method === 'tools/call') {
           expireNextCall = false
-          throw new StreamableHTTPError(404, 'Error POSTing to endpoint: Session terminated')
+          throw new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, 'Error POSTing to endpoint: Session terminated', { status: 404 })
         }
       }),
       close: vi.fn().mockResolvedValue(undefined),
@@ -2054,7 +2059,7 @@ describe('Feature: MCP Proxy', () => {
           return
         }
         if (!sessionAlive && message.method === 'tools/call') {
-          throw new StreamableHTTPError(404, 'Error POSTing to endpoint: Session terminated')
+          throw new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, 'Error POSTing to endpoint: Session terminated', { status: 404 })
         }
       }),
       close: vi.fn().mockResolvedValue(undefined),
@@ -2113,7 +2118,7 @@ describe('Feature: MCP Proxy', () => {
       send: vi.fn(async (message: any) => {
         sent.push(message)
         if (message.method === 'tools/call') {
-          throw new StreamableHTTPError(404, 'Error POSTing to endpoint: Not Found')
+          throw new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, 'Error POSTing to endpoint: Not Found', { status: 404 })
         }
       }),
       close: vi.fn().mockResolvedValue(undefined),
@@ -2355,7 +2360,8 @@ describe('Feature: MCP Proxy', () => {
       }) as unknown as Transport
 
     /** The SDK's own circuit breaker: it refuses to authorize again once it already has. */
-    const rejectedAfterAuthorizing = () => new StreamableHTTPError(401, 'Server returned 401 after successful authentication')
+    const rejectedAfterAuthorizing = () =>
+      new SdkHttpError(SdkErrorCode.ClientHttpAuthentication, 'Server returned 401 after re-authentication', { status: 401 })
 
     it('Scenario: Discard it and retry, rather than presenting it again', async () => {
       // Given a server that refuses the token it just issued, until it is thrown away
@@ -2420,7 +2426,7 @@ describe('Feature: MCP Proxy', () => {
       // Given a challenge the SDK has not already tried to authorize past
       const transportToClient = clientTransport()
       const transportToServer = {
-        send: vi.fn().mockRejectedValue(new StreamableHTTPError(401, 'Unauthorized')),
+        send: vi.fn().mockRejectedValue(new UnauthorizedError()),
         close: vi.fn().mockResolvedValue(undefined),
         start: vi.fn().mockResolvedValue(undefined),
         onmessage: vi.fn(),
@@ -3438,7 +3444,8 @@ describe('Feature: OAuth failures report what the server said', () => {
       const error = await parseErrorResponse(response)
 
       // Then it is the server's own error, not the shape of the object that carried it
-      expect(error).toBeInstanceOf(InvalidGrantError)
+      expect(error).toBeInstanceOf(OAuthError)
+      expect(error.code).toBe(OAuthErrorCode.InvalidGrant)
       expect(error.message).toBe('code_verifier does not match')
       expect(error.message).not.toContain('[object Response]')
     } finally {

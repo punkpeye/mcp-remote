@@ -1,8 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
-import { ListToolsRequestSchema, ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js'
+import { Server } from '@modelcontextprotocol/server'
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client'
 import { attachClientDiagnostics } from './client-diagnostics'
 
 const TOOLS = [{ name: 'search', description: 'Search', inputSchema: { type: 'object' as const } }]
@@ -12,7 +10,7 @@ async function connectedPair() {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
 
   const server = new Server({ name: 'stub', version: '1.0.0' }, { capabilities: { tools: {} } })
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
+  server.setRequestHandler('tools/list', async () => ({ tools: TOOLS }))
   await server.connect(serverTransport)
 
   const client = new Client({ name: 'mcp-remote', version: '0.0.0' }, { capabilities: {} })
@@ -38,7 +36,7 @@ describe('Feature: Client diagnostics', () => {
     attachClientDiagnostics(client, clientTransport, () => {})
 
     // Then a request still settles, rather than waiting out the SDK's request timeout
-    const tools = await client.request({ method: 'tools/list' }, ListToolsResultSchema)
+    const tools = await client.request({ method: 'tools/list' })
     expect(tools.tools.map((tool) => tool.name)).toEqual(['search'])
 
     await client.close()
@@ -50,7 +48,7 @@ describe('Feature: Client diagnostics', () => {
     attachClientDiagnostics(client, clientTransport, () => {})
 
     // When a request is answered
-    await client.request({ method: 'tools/list' }, ListToolsResultSchema)
+    await client.request({ method: 'tools/list' })
 
     // Then the response was narrated as well as delivered
     const logged = vi.mocked(console.error).mock.calls.map((call) => call.join(' '))

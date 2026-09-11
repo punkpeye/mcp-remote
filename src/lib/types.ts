@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events'
-import { OAuthClientInformationFull, OAuthClientMetadata } from '@modelcontextprotocol/sdk/shared/auth.js'
+import type { OAuthClientInformationFull, OAuthClientMetadata } from '@modelcontextprotocol/client'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 

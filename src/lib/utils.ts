@@ -1,10 +1,15 @@
-import { OAuthClientProvider, UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
-import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { Transport, type FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js'
-import { OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
-import { OAuthClientInformationFull, OAuthClientInformationFullSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
+import { OAuthClientInformationFullSchema } from '@modelcontextprotocol/core'
+import {
+  Client,
+  OAuthClientProvider,
+  OAuthError,
+  SdkErrorCode,
+  SdkHttpError,
+  SSEClientTransport,
+  StreamableHTTPClientTransport,
+  UnauthorizedError,
+} from '@modelcontextprotocol/client'
+import type { FetchLike, OAuthClientInformationFull, Transport } from '@modelcontextprotocol/client'
 import {
   AuthCodeResult,
   KeepAliveConfig,
@@ -225,42 +230,33 @@ const RECONNECT_ENDPOINT_POLL_MS = 25
 /**
  * Whether the server refused a token the SDK had only just obtained.
  *
- * The SDK carries a circuit breaker for this: once an authorization succeeds it sets a private
- * flag, and answers any later 401 by throwing rather than authorizing again, so a server that
- * refuses every token cannot spin it forever. What the SDK does not do is clear the token it was
- * refused - so the same dead credential is read back from disk on the next run, and the next, and
- * the connection fails the same way every time with nothing to explain it.
+ * The SDK retries a 401 once by authorizing, and if the fresh token is refused too it gives up so
+ * a server that accepts nothing cannot spin the flow forever. What it does not do is clear the
+ * token it was refused - so the same dead credential is read back from disk on the next run, and
+ * the next, and the connection fails the same way every time with nothing to explain it.
  *
- * This is deliberately narrow. It is not `error.code === 401`: a 401 the SDK has not already tried
- * to authorize past is an ordinary challenge, and the SDK's own handling is what should see it.
+ * This is deliberately narrow, and the SDK draws the line for us: an ordinary challenge - one it
+ * has not already tried to authorize past - arrives as `UnauthorizedError`, and only the retry
+ * that failed again is an `SdkHttpError`. So the type and the code decide it, with no dependence
+ * on the wording of a message (v1 was matched on exactly that, and v2 rephrased it).
  */
 function isRejectedAfterAuthorizing(error: unknown): boolean {
-  return error instanceof StreamableHTTPError && error.code === 401 && error.message.includes('401 after successful authentication')
+  return error instanceof SdkHttpError && error.code === SdkErrorCode.ClientHttpAuthentication && error.status === 401
 }
 
 /**
- * Discards the refused token, and the flag that stops the SDK asking for another.
- *
- * With both cleared, the next attempt finds no token, so the SDK runs a full sign-in through the
+ * Discards the refused token, so the next attempt finds none and runs a full sign-in through the
  * ordinary path rather than anything special-cased here.
+ *
+ * Nothing has to be reset on the transport: the SDK scopes its "already tried authorizing" flag to
+ * a single send rather than to the transport, so a later request starts willing to authorize again
+ * on its own.
  */
-export async function forgetRejectedAuthorization(
-  authProvider: OAuthClientProvider,
-  ...transports: Array<Transport | undefined>
-): Promise<void> {
+export async function forgetRejectedAuthorization(authProvider: OAuthClientProvider): Promise<void> {
   try {
     await authProvider.invalidateCredentials?.('tokens')
   } catch (error) {
     debugLog('Could not discard the refused token', error)
-  }
-
-  for (const transport of transports) {
-    // The SDK exposes the breaker only as a private field, and leaving it set would have the
-    // retry throw on the first 401 instead of signing in
-    const breaker = transport as (Transport & { _hasCompletedAuthFlow?: boolean }) | undefined
-    if (breaker && '_hasCompletedAuthFlow' in breaker) {
-      breaker._hasCompletedAuthFlow = false
-    }
   }
 }
 
@@ -663,7 +659,7 @@ export function mcpProxy({
    * would just add a doomed handshake to every failing request.
    */
   function isSessionExpired(error: Error) {
-    return error instanceof StreamableHTTPError && error.code === 404 && transportToServer.sessionId !== undefined
+    return error instanceof SdkHttpError && error.status === 404 && transportToServer.sessionId !== undefined
   }
 
   /**
@@ -1257,9 +1253,8 @@ export async function connectToRemoteServer(
     return transport
   } catch (error: any) {
     // Check if it's a protocol error and we should attempt fallback
-    // StreamableHTTPError has a `code` property with the HTTP status code
-    const isStreamableHTTPError = error instanceof StreamableHTTPError
-    const httpStatusCode = isStreamableHTTPError ? error.code : null
+    // SdkHttpError carries the HTTP status on `status`; `code` is an SdkErrorCode string
+    const httpStatusCode = error instanceof SdkHttpError ? error.status : null
     const shouldFallbackOnError =
       shouldAttemptFallback &&
       error instanceof Error &&
@@ -1307,14 +1302,14 @@ export async function connectToRemoteServer(
 
       log('The server rejected a token it had just issued - discarding it and signing in again')
       debugLog('Rejected token after a successful authorization', { message: error.message })
-      await forgetRejectedAuthorization(authProvider, transport, authChallengeTransport)
+      await forgetRejectedAuthorization(authProvider)
 
       recursionReasons.add(REASON_REJECTED_TOKEN)
       return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
       log('Authentication required. Initializing auth...')
       debugLog('Authentication error detected', {
-        errorCode: error instanceof OAuthError ? error.errorCode : undefined,
+        errorCode: error instanceof OAuthError ? error.code : undefined,
         errorMessage: error.message,
         stack: error.stack,
       })

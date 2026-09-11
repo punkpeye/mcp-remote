@@ -8,7 +8,6 @@ const mockState = vi.hoisted(() => ({
     start: ReturnType<typeof vi.fn>
     finishAuth: ReturnType<typeof vi.fn>
     close: ReturnType<typeof vi.fn>
-    _hasCompletedAuthFlow?: boolean
   }>,
   // Number of remaining `Client.connect` calls that should fail with an auth error.
   connectFailuresRemaining: 1,
@@ -18,18 +17,27 @@ const mockState = vi.hoisted(() => ({
   finishAuthCalls: [] as string[],
 }))
 
-vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => {
-  // Mirrors the real class, whose constructor takes the status first. Reversing them here would
-  // typecheck against the real signature and then build the wrong error at runtime.
-  class StreamableHTTPError extends Error {
-    code?: number
-    constructor(code: number, message: string) {
+vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
+  // Partial mock: `utils.ts` imports more than the three classes stubbed below from this module
+  // (UnauthorizedError among them), and a bare factory would leave every one of those undefined.
+  const actual = await importOriginal<typeof import('@modelcontextprotocol/client')>()
+  const { SdkErrorCode } = actual
+
+  // Mirrors the real class: the HTTP status rides in `data`, and `code` is an SdkErrorCode string.
+  // Reversing them here would typecheck against the real signature and then build the wrong error.
+  class SdkHttpError extends Error {
+    constructor(
+      public code: string,
+      message: string,
+      public data: { status: number; statusText?: string },
+    ) {
       super(message)
-      this.code = code
+    }
+    get status() {
+      return this.data.status
     }
   }
   class StreamableHTTPClientTransport {
-    _hasCompletedAuthFlow = false
     start = vi.fn().mockResolvedValue(undefined)
     finishAuth = vi.fn(async (code: string) => {
       mockState.finishAuthCalls.push(code)
@@ -42,10 +50,6 @@ vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => {
       mockState.httpTransports.push(this)
     }
   }
-  return { StreamableHTTPClientTransport, StreamableHTTPError }
-})
-
-vi.mock('@modelcontextprotocol/sdk/client/sse.js', () => {
   class SSEClientTransport {
     start = vi.fn().mockResolvedValue(undefined)
     finishAuth = vi.fn().mockResolvedValue(undefined)
@@ -55,11 +59,6 @@ vi.mock('@modelcontextprotocol/sdk/client/sse.js', () => {
       public opts: unknown,
     ) {}
   }
-  return { SSEClientTransport }
-})
-
-vi.mock('@modelcontextprotocol/sdk/client/index.js', async () => {
-  const { StreamableHTTPError } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js')
   class Client {
     constructor(
       public info: unknown,
@@ -71,7 +70,7 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', async () => {
       // (and stores) the challenge — exactly as happens in real proxy mode.
       if (mockState.rejectedTokenFailuresRemaining > 0) {
         mockState.rejectedTokenFailuresRemaining--
-        throw new StreamableHTTPError(401, 'Server returned 401 after successful authentication')
+        throw new SdkHttpError(SdkErrorCode.ClientHttpAuthentication, 'Server returned 401 after re-authentication', { status: 401 })
       }
       if (mockState.connectFailuresRemaining > 0) {
         mockState.connectFailuresRemaining--
@@ -79,7 +78,7 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', async () => {
       }
     }
   }
-  return { Client }
+  return { ...actual, StreamableHTTPClientTransport, SSEClientTransport, Client, SdkHttpError }
 })
 
 // Import after mocks are registered.
@@ -140,11 +139,9 @@ describe('connectToRemoteServer', () => {
     // Then the refused token is thrown away
     expect(invalidateCredentials).toHaveBeenCalledWith('tokens')
 
-    // And the SDK's own circuit breaker is released, or the retry would throw on the first 401
-    // instead of authorizing
-    expect(mockState.httpTransports.every((t) => t._hasCompletedAuthFlow !== true)).toBe(true)
-
-    // And it reconnected rather than failing at startup
+    // And it reconnected rather than failing at startup. Nothing has to be reset on the transport
+    // for that: the SDK scopes its "already tried authorizing" flag to a single send, so the
+    // reconnect starts willing to authorize again on its own.
     expect(mockState.httpTransports.length).toBeGreaterThanOrEqual(3)
   })
 
@@ -161,7 +158,7 @@ describe('connectToRemoteServer', () => {
     // Then it stops rather than churning credentials against a server that will never accept one
     await expect(
       connectToRemoteServer(null, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first'),
-    ).rejects.toThrow('401 after successful authentication')
+    ).rejects.toThrow('401 after re-authentication')
 
     expect(authProvider.invalidateCredentials).toHaveBeenCalledTimes(1)
   })

@@ -10,9 +10,9 @@
     "test:concurrency": "vitest run concurrent-instances.test.ts"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.23.0",
+    "@modelcontextprotocol/client": "^2.0.0",
     "@types/node": "^22.10.2",
-    "vitest": "^2.1.8",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "vitest": "^2.1.8"
   }
 }
