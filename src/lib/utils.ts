@@ -17,6 +17,8 @@ import {
   isDroppedInModernEra,
   isInputRequiredResult,
   isModernOnlyNotification,
+  clientDeclaredCapabilityFor,
+  MAX_INPUT_REQUESTS_PER_ROUND,
   localAnswerFor,
   MAX_INPUT_REQUIRED_ROUNDS,
   readEraFromDiscoverResponse,
@@ -382,6 +384,34 @@ const DISCOVER_TIMEOUT_MS = 10_000
  */
 const SUBSCRIPTION_LIFETIME_MS = 24 * 60 * 60 * 1000
 
+/**
+ * The backstop on one leg of a multi-round-trip exchange.
+ *
+ * Deliberately generous, and deliberately not {@link INITIALIZE_TIMEOUT_MS}: the legs here are a
+ * sampling call the client answers by asking a model, an elicitation a person has to read, and a
+ * retried tool call that can legitimately run for as long as any other. None of those is the one
+ * request "never expected to run long" that the initialize budget was written for.
+ *
+ * The client's own SDK times its handlers out and answers with an error, so this only matters for a
+ * peer that has stopped answering altogether - which is what it is here to stop holding a request
+ * open forever.
+ */
+const MULTI_ROUND_TRIP_LEG_TIMEOUT_MS = 10 * 60 * 1000
+
+/** How long to wait before reopening a change-notification stream that ended. */
+const SUBSCRIPTION_REOPEN_DELAY_MS = 2_000
+
+/** How many times a change-notification stream may end without ever staying open before this stops. */
+const SUBSCRIPTION_REOPEN_LIMIT = 5
+
+/**
+ * How long a stream has to stay open to count as having worked.
+ *
+ * Below this it did not really open, whatever it answered, and reopening it on a timer would turn
+ * one polite answer into a request every couple of seconds for the life of the process.
+ */
+const SUBSCRIPTION_HELD_OPEN_MS = 30_000
+
 /** A timer that never keeps the process alive on its own. */
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -509,6 +539,17 @@ export function mcpProxy({
   let eraNegotiation: Promise<void> | null = null
   let discoverSeq = 0
   const pendingDiscover = new Map<string, (message: Message) => void>()
+  /**
+   * The prefix every id this proxy mints carries.
+   *
+   * Checked before any of the maps below are consulted, so a client that happens to use the same
+   * string as one of our ids cannot have its request swallowed or its answer stolen - and a late
+   * answer to a question we have already given up on is dropped rather than forwarded to a server
+   * that never asked it.
+   */
+  const OWN_ID_PREFIX = 'mcp-remote-'
+  const isOwnId = (id: unknown): id is string => typeof id === 'string' && id.startsWith(OWN_ID_PREFIX)
+
   /** Requests this proxy issued to the remote on its own account, keyed by the id it minted. */
   const pendingOwnRequests = new Map<string, (message: Message) => void>()
   /** Requests this proxy put to the local client on the remote's behalf, awaiting its answer. */
@@ -583,12 +624,29 @@ export function mcpProxy({
   transportToClient.onmessage = (_message) => {
     const answeringId = (_message as any).id
 
-    // The client answering a question this proxy put to it on the remote's behalf. It is ours to
-    // consume: the remote never saw a request with this id, because this proxy minted it.
-    if (typeof answeringId === 'string' && pendingClientRequests.has(answeringId)) {
-      const settle = pendingClientRequests.get(answeringId)!
+    // The client answering a question this proxy put to it on the remote's behalf. Everything
+    // carrying one of our ids is ours, including an answer that arrives after we stopped waiting -
+    // forwarding that on would hand the server a response to a request it never made.
+    if (isOwnId(answeringId)) {
+      // A *request* from the client in this namespace would collide with one of ours, so it is
+      // refused rather than forwarded - the alternative is the client's answer being consumed here
+      // and the client waiting for one that never comes.
+      if ((_message as any).method !== undefined) {
+        log(`Refusing a client request whose id is reserved by this proxy: ${answeringId}`)
+        transportToClient
+          .send({
+            jsonrpc: '2.0',
+            id: answeringId,
+            error: { code: -32600, message: `mcp-remote reserves request ids beginning with "${OWN_ID_PREFIX}"` },
+          } as Message)
+          .catch(onClientError)
+        return
+      }
+
+      const settle = pendingClientRequests.get(answeringId)
       pendingClientRequests.delete(answeringId)
-      settle(_message as any)
+      if (settle) settle(_message as any)
+      else debugLog('Discarding a late answer to a question this proxy had given up on', { id: answeringId })
       return
     }
 
@@ -625,10 +683,16 @@ export function mcpProxy({
 
       // The handshake is the only moment the era can be settled: it is the first thing the client
       // sends, and how every message after it has to be written depends on the answer.
-      if (protocolMode === 'auto' && era === null) {
-        eraNegotiation = negotiateEra(message).finally(() => {
-          eraNegotiation = null
+      // `era === null` alone is not enough: it stays null for the whole probe, so a client that
+      // re-sends `initialize` before the probe answers - one whose own handshake timeout is shorter
+      // than ours - would start a second negotiation, a second synthesized handshake, and a second
+      // subscription stream.
+      if (protocolMode === 'auto' && era === null && !eraNegotiation) {
+        const negotiation = negotiateEra(message).finally(() => {
+          // Only the negotiation that owns the gate may open it
+          if (eraNegotiation === negotiation) eraNegotiation = null
         })
+        eraNegotiation = negotiation
         return
       }
     }
@@ -639,32 +703,29 @@ export function mcpProxy({
   transportToServer.onmessage = (_message) => {
     const incomingId = (_message as any).id
 
-    // Answers to our own keep-alive pings are ours to consume too. The client never sent the
-    // request, so forwarding the response would hand it an id it has nothing to match against.
-    if (typeof incomingId === 'string' && pendingPings.delete(incomingId)) {
-      return
+    // Answers to the requests this proxy made on its own account are ours to consume: the keep-alive
+    // pings, the era probe, the subscription, each leg of a multi-round-trip retry, and the
+    // re-initialize handshake. The client never sent any of them, so forwarding one would hand it an
+    // id it has nothing to match against.
+    //
+    // Only what is still outstanding is claimed. An id we have already settled belongs to whoever
+    // sent it next, and client ids are kept out of this namespace on the way past instead.
+    if (typeof incomingId === 'string') {
+      if (pendingPings.delete(incomingId)) return
+
+      for (const pending of [pendingOwnRequests, pendingDiscover, pendingReinit]) {
+        const settle = pending.get(incomingId)
+        if (settle) {
+          pending.delete(incomingId)
+          settle(_message as any)
+          return
+        }
+      }
     }
 
     // Confirmation of a stream this proxy opened for the client, which the client never asked for
     if (era?.era === 'modern' && (_message as any).method && isModernOnlyNotification((_message as any).method)) {
       debugLog('Consuming a notification that belongs to this proxy, not the client', { method: (_message as any).method })
-      return
-    }
-
-    // The answer to our own era probe is ours to consume too - the client never asked for it
-    if (typeof incomingId === 'string' && pendingDiscover.has(incomingId)) {
-      const settle = pendingDiscover.get(incomingId)!
-      pendingDiscover.delete(incomingId)
-      settle(_message as any)
-      return
-    }
-
-    // Likewise for anything else this proxy asked on its own account: the subscription it opened
-    // for the client, and each leg of a multi-round-trip retry
-    if (typeof incomingId === 'string' && pendingOwnRequests.has(incomingId)) {
-      const settle = pendingOwnRequests.get(incomingId)!
-      pendingOwnRequests.delete(incomingId)
-      settle(_message as any)
       return
     }
 
@@ -680,16 +741,11 @@ export function mcpProxy({
           onServerError(error)
           replyWithError(original, error)
         })
+        // The transformer is still holding this request against a response that now arrives from
+        // `answerClient` rather than from here
+
         return
       }
-    }
-
-    // Responses to our own re-initialize handshake are ours to consume, not the client's
-    if (typeof incomingId === 'string' && pendingReinit.has(incomingId)) {
-      const settle = pendingReinit.get(incomingId)!
-      pendingReinit.delete(incomingId)
-      settle(_message as any)
-      return
     }
 
     if (incomingId !== undefined && incomingId !== null) {
@@ -726,21 +782,24 @@ export function mcpProxy({
 
   transportToClient.onclose = () => {
     stopKeepAlive()
+    transportToClientClosed = true
+    failOwnPendingRequests('the connection closed before this could be answered')
     if (transportToServerClosed) {
       return
     }
 
-    transportToClientClosed = true
     debugLog('Local transport closed, closing remote transport')
     transportToServer.close().catch(onServerError)
   }
 
   transportToServer.onclose = () => {
     stopKeepAlive()
+    transportToServerClosed = true
+    failOwnPendingRequests('the connection closed before this could be answered')
     if (transportToClientClosed) {
       return
     }
-    transportToServerClosed = true
+
     debugLog('Remote transport closed, closing local transport')
     transportToClient.close().catch(onClientError)
   }
@@ -888,7 +947,7 @@ export function mcpProxy({
         .send({ jsonrpc: '2.0', id: initialize.id, result: synthesizeInitializeResult(era.discover, clientIdentity) })
         .catch(onClientError)
 
-      void openChangeSubscription(era.version, era.discover.capabilities)
+      openChangeSubscription(era.version, era.discover.capabilities).catch(onServerError)
       return
     }
 
@@ -991,20 +1050,46 @@ export function mcpProxy({
       return
     }
 
-    try {
-      debugLog('Subscribing to change notifications on the client behalf', { notifications })
-      // Resolves only when the stream ends, so the timeout is the life of the session rather than
-      // the life of a request
-      const response = await askRemote(
-        (id) => subscriptionsListenRequest(id, clientIdentity, version, notifications) as Message,
-        SUBSCRIPTION_LIFETIME_MS,
-      )
-      if (response.error) {
-        log(`The remote server refused the change-notification subscription: ${JSON.stringify(response.error)}`)
+    // A stream is not a session: it ends on a server restart, a load balancer's idle timeout, or a
+    // network flake, and the client would go on believing nothing has changed since. Reopening is
+    // the only thing that turns that back into a working subscription, because nothing below this
+    // notices it stopped.
+    for (let attempts = 0; attempts < SUBSCRIPTION_REOPEN_LIMIT; attempts++) {
+      const openedAt = Date.now()
+
+      try {
+        debugLog('Subscribing to change notifications on the client behalf', { notifications })
+        // Resolves only when the stream ends, so this bounds a session's worth of notifications
+        // rather than a request
+        const response = await askRemote(
+          (id) => subscriptionsListenRequest(id, clientIdentity, version, notifications) as Message,
+          SUBSCRIPTION_LIFETIME_MS,
+        )
+
+        if (response.error) {
+          // A refusal is a decision, not a flake; reopening would only ask again and be told again
+          log(`The remote server refused the change-notification subscription: ${JSON.stringify(response.error)}`)
+          return
+        }
+
+        debugLog('The change-notification stream ended', { heldForMs: Date.now() - openedAt })
+      } catch (error) {
+        debugLog('The change-notification stream failed', { heldForMs: Date.now() - openedAt, error })
       }
-    } catch (error) {
-      debugLog('The change-notification subscription ended', error)
+
+      // A stream that stayed open did its job, so reopening it is ordinary maintenance and the
+      // budget starts again. One that ended immediately is a server that does not really hold this
+      // open, and reopening it on a timer is how a proxy comes to send thousands of requests an
+      // hour to a server that answered the first one perfectly politely.
+      if (Date.now() - openedAt >= SUBSCRIPTION_HELD_OPEN_MS) attempts = -1
+
+      if (transportToClientClosed || transportToServerClosed) return
+
+      await sleep(SUBSCRIPTION_REOPEN_DELAY_MS)
+      if (transportToClientClosed || transportToServerClosed) return
     }
+
+    log('Giving up on change notifications: the subscription stream kept ending as soon as it opened')
   }
 
   /**
@@ -1023,6 +1108,18 @@ export function mcpProxy({
    * @param firstResult The `input_required` result that started the exchange
    * @param version The revision being spoken to the remote server
    */
+  /**
+   * Answers the client's own request, through the same seam every other answer goes through.
+   *
+   * Sending straight to the transport would skip {@link messageTransformer}, and with it the
+   * `--ignore-tool` filter - so a `tools/list` that happened to be answered across a
+   * multi-round-trip exchange would hand back the tools the user asked to hide. Which tools those
+   * are is exactly what the remote server would have to control to arrange it.
+   */
+  function answerClient(message: Message) {
+    transportToClient.send(messageTransformer.interceptResponse(message)).catch(onClientError)
+  }
+
   async function driveInputRequired(original: Message, firstResult: any, version: string) {
     let pending = firstResult
 
@@ -1030,12 +1127,31 @@ export function mcpProxy({
       const requests: Record<string, { method: string; params?: unknown }> = pending.inputRequests ?? {}
       const responses: Record<string, unknown> = {}
 
+      // Nothing to answer and no state to carry forward means the retry would be byte-identical to
+      // the request that produced this - so the tool would simply run again, ten more times, with
+      // every side effect that implies
+      if (Object.keys(requests).length === 0 && pending.requestState === undefined) {
+        throw new Error('the remote server asked for more input but named none, and carried no state to continue from')
+      }
+
+      if (Object.keys(requests).length > MAX_INPUT_REQUESTS_PER_ROUND) {
+        throw new Error(
+          `the remote server embedded ${Object.keys(requests).length} questions in one answer, which is more than this proxy will put to a client at once`,
+        )
+      }
+
       for (const [key, request] of Object.entries(requests)) {
-        if (!canFulfilInputRequest(request.method)) {
+        if (!canFulfilInputRequest(request.method, request.params)) {
           throw new Error(`the remote server asked for ${request.method}, which this proxy cannot put to a 2025-era client`)
         }
 
-        const answer = await askClient(request.method, request.params, INITIALIZE_TIMEOUT_MS)
+        // The client told us in its handshake what it can do, and the modern era's embedded form
+        // does not change that. Asking anyway earns a -32601 the client is right to send.
+        if (!clientDeclaredCapabilityFor(request.method, clientIdentity.capabilities)) {
+          throw new Error(`the remote server asked for ${request.method}, which this client did not declare it supports`)
+        }
+
+        const answer = await askClient(request.method, request.params, MULTI_ROUND_TRIP_LEG_TIMEOUT_MS)
         if (answer.error) {
           throw new Error(`the local client refused ${request.method}: ${JSON.stringify(answer.error)}`)
         }
@@ -1045,18 +1161,18 @@ export function mcpProxy({
       const retryParams = inputRequiredRetryParams(original.params, responses, pending.requestState)
       const reply = await askRemote(
         (id) => stampModernMeta({ ...original, id, params: retryParams }, clientIdentity, version) as Message,
-        INITIALIZE_TIMEOUT_MS,
+        MULTI_ROUND_TRIP_LEG_TIMEOUT_MS,
       )
 
       if (reply.error) {
-        transportToClient.send({ jsonrpc: '2.0', id: original.id, error: reply.error } as Message).catch(onClientError)
+        answerClient({ jsonrpc: '2.0', id: original.id, error: reply.error } as Message)
         return
       }
 
       if (!isInputRequiredResult(reply.result)) {
         const translated = translateModernResult(reply.result)
         const answer = 'error' in translated ? { error: translated.error } : { result: translated.result }
-        transportToClient.send({ jsonrpc: '2.0', id: original.id, ...answer } as Message).catch(onClientError)
+        answerClient({ jsonrpc: '2.0', id: original.id, ...answer } as Message)
         return
       }
 
@@ -1178,20 +1294,36 @@ export function mcpProxy({
   function forwardInOrder(message: Message) {
     // Nothing can be written correctly until the probe has said which era to write it in
     if (eraNegotiation) {
-      void eraNegotiation.then(() => forwardInOrder(message))
+      eraNegotiation.then(() => forwardInOrder(message)).catch(onServerError)
       return
     }
 
-    if (era?.era === 'modern') {
-      const answer = message.method ? localAnswerFor(message.method) : undefined
-      if (answer && message.id !== undefined && message.id !== null) {
-        debugLog('Answering locally a method the modern era does not define', { method: message.method })
-        transportToClient.send({ jsonrpc: '2.0', id: message.id, result: answer }).catch(onClientError)
+    if (era?.era === 'modern' && message.method) {
+      const answer = localAnswerFor(message.method)
+      if (answer) {
+        // A request is answered; the same method sent as a notification is simply dropped, because
+        // there is nothing to answer and the server has no such method to forward it to
+        if (message.id !== undefined && message.id !== null) {
+          debugLog('Answering locally a method the modern era does not define', { method: message.method })
+          transportToClient.send({ jsonrpc: '2.0', id: message.id, result: answer }).catch(onClientError)
+        } else {
+          debugLog('Dropping a notification for a method the modern era does not define', { method: message.method })
+        }
         return
       }
 
-      if (message.method && isDroppedInModernEra(message.method)) {
+      if (isDroppedInModernEra(message.method)) {
         debugLog('Dropping a notification the modern era has no place for', { method: message.method })
+        return
+      }
+
+      // The handshake was answered here, so a repeat is this proxy's to answer too - forwarding it
+      // would POST a method the 2026-07-28 era retired
+      if (message.method === 'initialize' && message.id !== undefined && message.id !== null) {
+        debugLog('Answering a repeated handshake from the bridge rather than forwarding it')
+        transportToClient
+          .send({ jsonrpc: '2.0', id: message.id, result: synthesizeInitializeResult(era.discover, clientIdentity) })
+          .catch(onClientError)
         return
       }
     }
@@ -1259,7 +1391,13 @@ export function mcpProxy({
       if (message.method === 'initialize') scheduleInitializeTimeout(message)
       return
     } catch (error) {
-      if (awaitsAnswer) pendingRequests.delete(message.id!)
+      if (awaitsAnswer) {
+        pendingRequests.delete(message.id!)
+        // Left behind, a later stray frame for this id would find a request the client has already
+        // been told failed, and start a whole multi-round-trip exchange - re-running the tool call
+        // and answering the client a second time
+        modernOriginals.delete(message.id!)
+      }
 
       // A token the server refused straight after issuing it is not a sign-in problem yet - it is
       // a dead credential the SDK will keep presenting, because it will not ask for another while
@@ -1344,8 +1482,28 @@ export function mcpProxy({
     debugLog('Failing requests the dropped session can no longer answer', { ids: [...pendingRequests] })
     for (const id of pendingRequests) {
       transportToClient.send({ jsonrpc: '2.0', id, error: { code: -32001, message: `mcp-remote: ${reason}` } }).catch(onClientError)
+      // Answered now, so there is nothing left to retry a multi-round-trip exchange for
+      modernOriginals.delete(id)
     }
     pendingRequests.clear()
+  }
+
+  /**
+   * Settles everything this proxy is itself waiting on, because nothing will answer it now.
+   *
+   * These are requests the peers never made and so will never be failed by anything else: the
+   * subscription stream, each leg of a multi-round-trip retry, and each question put to the client
+   * on the server's behalf. Left alone they would sit until their own timeouts, holding a tool call
+   * open long after the transport carrying it went away.
+   */
+  function failOwnPendingRequests(reason: string) {
+    for (const [id, settle] of [...pendingOwnRequests, ...pendingClientRequests, ...pendingDiscover, ...pendingReinit]) {
+      settle({ jsonrpc: '2.0', id, error: { code: -32001, message: `mcp-remote: ${reason}` } } as Message)
+    }
+    pendingOwnRequests.clear()
+    pendingClientRequests.clear()
+    pendingDiscover.clear()
+    pendingReinit.clear()
   }
 
   /**
@@ -1512,16 +1670,39 @@ export type AuthInitializer = (options?: { forceRefresh?: boolean }) => Promise<
  */
 function substituteEnvVars(value: string, context: string): string {
   return value.replace(/\$\{([^}]+)}/g, (match, envVarName) => {
-    const envVarValue = process.env[envVarName]
-
-    if (envVarValue !== undefined) {
-      log(`Replacing ${match} with environment value in ${context}`)
-      return envVarValue
+    // `in` would match `toString`, `constructor` and the rest of Object.prototype, which expand to
+    // source text rather than to anything the user set
+    if (!Object.hasOwn(process.env, envVarName)) {
+      log(`Warning: Environment variable '${envVarName}' not found for ${context}; leaving ${match} as it is.`)
+      return match
     }
 
-    log(`Warning: Environment variable '${envVarName}' not found for ${context}.`)
-    return ''
+    log(`Replacing ${match} with environment value in ${context}`)
+    return process.env[envVarName]!
   })
+}
+
+/**
+ * Reads a JSON argument that may carry `${VAR}` placeholders.
+ *
+ * Two things are deliberate here. A value with no placeholder in it is not touched at all, so a
+ * credential that happens to contain `${` survives an upgrade to a version that learned to expand
+ * them. And a parse failure is re-thrown without Node's message, because that message quotes the
+ * first characters of what failed to parse - which, for an argument that is one placeholder holding
+ * a secret, is the secret.
+ *
+ * @param raw The JSON text, before any expansion
+ * @param context Where the value came from, for the log line when a variable is missing
+ * @returns The parsed value
+ */
+function parseJsonWithEnvVars(raw: string, context: string): any {
+  const expanded = raw.includes('${') ? substituteEnvVars(raw, context) : raw
+
+  try {
+    return JSON.parse(expanded)
+  } catch {
+    throw new Error(`Could not parse the ${context} as JSON${raw.includes('${') ? ' after expanding its ${...} placeholders' : ''}`)
+  }
 }
 
 /** The header shapes `fetch` accepts, plus the `Headers` the SDK actually hands over. */
@@ -2450,10 +2631,10 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     const staticOAuthClientInfoArg = args[staticOAuthClientInfoIndex + 1]
     if (staticOAuthClientInfoArg.startsWith('@')) {
       const filePath = staticOAuthClientInfoArg.slice(1)
-      staticOAuthClientInfo = JSON.parse(substituteEnvVars(await readFile(filePath, 'utf8'), 'static OAuth client information'))
+      staticOAuthClientInfo = parseJsonWithEnvVars(await readFile(filePath, 'utf8'), 'static OAuth client information')
       log(`Using static OAuth client information from file: ${filePath}`)
     } else {
-      staticOAuthClientInfo = JSON.parse(substituteEnvVars(staticOAuthClientInfoArg, 'static OAuth client information'))
+      staticOAuthClientInfo = parseJsonWithEnvVars(staticOAuthClientInfoArg, 'static OAuth client information')
       log(`Using static OAuth client information from string`)
     }
   }

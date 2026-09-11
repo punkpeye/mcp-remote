@@ -10,6 +10,17 @@ import { log, debugLog, setupOAuthCallbackServerWithLongPoll, MCP_REMOTE_ID_PATH
 /** How long to wait on another instance's sign-in before going it alone. Sign-ins involve a human. */
 const FOLLOWER_PATIENCE_MS = 3 * 60_000
 
+/**
+ * How long to wait on a sibling the *second* time, after its tokens were already refused once.
+ *
+ * The first wait is the patient one, because a sign-in takes as long as a person takes. By the time
+ * this instance is looking again it has already waited that out and been handed something that did
+ * not work, so waiting the full window again only doubles a delay the host may already be reading
+ * as a hang - and the thing actually worth checking, whether the callback port has been released,
+ * is answered in seconds.
+ */
+const REFRESH_FOLLOWER_PATIENCE_MS = 10_000
+
 export type AuthCoordinator = {
   /** @param options `forceRefresh` discards a cached verdict this instance has already acted on */
   initializeAuth: (options?: { forceRefresh?: boolean }) => Promise<{
@@ -50,11 +61,24 @@ export function createLazyAuthCoordinator(
 
   return {
     initializeAuth: async (options) => {
+      let refreshed = false
+
       if (authState && options?.forceRefresh) {
         // The cached verdict has been acted on and did not hold. Keeping it would keep answering
         // "wait for the sibling" to an instance that has already waited (issue #352).
         debugLog('Discarding the cached auth coordination verdict and looking again')
+        refreshed = true
+
+        // The callback server the old verdict carries is still listening, and nothing else holds a
+        // handle to it once this is nulled. Left open it both leaks a socket and answers the port
+        // probe of the very `coordinateAuth` about to run - so this instance would find "a sibling"
+        // on the port, and the sibling would be itself.
+        const stale = authState
         authState = null
+        // Awaited, not fired and forgotten: the port has to be free before the fresh
+        // `coordinateAuth` below tries to bind it, or that bind races this close and can still
+        // find the socket this instance is in the middle of giving up.
+        await stale.then(({ server }) => new Promise<void>((resolve) => server.close(() => resolve()))).catch(() => {})
       }
 
       if (authState) {
@@ -65,7 +89,15 @@ export function createLazyAuthCoordinator(
       log('Initializing auth coordination on-demand')
       debugLog('Initializing auth coordination on-demand', { serverUrlHash, callbackPort })
 
-      authState = coordinateAuth(serverUrlHash, callbackPath, callbackPort, events, authTimeoutMs, strictPort)
+      authState = coordinateAuth(
+        serverUrlHash,
+        callbackPath,
+        callbackPort,
+        events,
+        authTimeoutMs,
+        strictPort,
+        refreshed ? REFRESH_FOLLOWER_PATIENCE_MS : undefined,
+      )
       try {
         const resolved = await authState
         debugLog('Auth coordination completed', { skipBrowserAuth: resolved.skipBrowserAuth, actualPort: resolved.actualPort })

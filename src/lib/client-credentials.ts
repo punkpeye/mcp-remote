@@ -34,6 +34,19 @@ export async function authorizeWithClientCredentials({
     throw new Error('The authorization server metadata has no token endpoint')
   }
 
+  // The endpoint is discovered from documents the MCP server points at, so it is the server that
+  // chooses where this goes. Every other flow here registers as a public client and has no secret
+  // to lose; this one sends a long-lived machine credential with nobody watching, so it does not
+  // send it in the clear - and it says where it went, at a level the user sees without --debug.
+  const endpoint = new URL(tokenEndpoint)
+  if (endpoint.protocol !== 'https:' && endpoint.hostname !== 'localhost' && endpoint.hostname !== '127.0.0.1') {
+    throw new Error(
+      `Refusing to send the client secret to ${endpoint.origin} over ${endpoint.protocol.replace(':', '')}. ` +
+        'The client_credentials grant needs an https token endpoint.',
+    )
+  }
+  log(`Requesting a token from ${endpoint.origin} with the client_credentials grant`)
+
   if (!clientInformation.client_secret) {
     throw new Error(
       'The client_credentials grant needs a client secret. Supply one with --static-oauth-client-info, ' +
@@ -57,9 +70,8 @@ export async function authorizeWithClientCredentials({
 
   if (!response.ok) {
     const body = (await response.json().catch(() => undefined)) as { error?: string; error_description?: string } | undefined
-    throw new Error(
-      `The client_credentials token request failed (HTTP ${response.status}): ${body?.error_description ?? body?.error ?? 'unknown error'}`,
-    )
+    const detail = (body?.error_description ?? body?.error ?? 'unknown error').slice(0, 500)
+    throw new Error(`The client_credentials token request failed (HTTP ${response.status}): ${detail}`)
   }
 
   const tokens = OAuthTokensSchema.parse(await response.json())

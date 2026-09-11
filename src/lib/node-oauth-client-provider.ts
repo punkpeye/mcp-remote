@@ -1132,7 +1132,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       throw new Error('No OAuth client credentials were supplied; pass them with --static-oauth-client-info')
     }
 
-    const scope = this.getEffectiveScope()
+    // Not `getEffectiveScope`: its fallback is `openid email profile`, an OIDC *user* scope that
+    // several authorization servers reject outright for a grant with no user in it. Asking for
+    // nothing is the honest default here - the server knows what this client is entitled to.
+    const scope = this.requestedScope()
     const tokens = await authorizeWithClientCredentials({
       metadata,
       clientInformation,

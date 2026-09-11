@@ -3187,6 +3187,238 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     expect(clientSent.find((message) => message.id === 'call-1').result).toEqual({ content: [{ type: 'text', text: 'done' }] })
   })
 
+  it('Scenario: Reopen a change-notification stream the server closed, so the client keeps hearing', async () => {
+    // A stream is not a session: it ends on a restart or an idle timeout, and nothing below this
+    // notices it stopped - the client simply stops being told anything ever changed
+    const serverSent: any[] = []
+    const transportToClient = clientTransport([])
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') {
+        return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: { listChanged: true } }) }
+      }
+      // The stream ends cleanly the moment it is opened
+      if (message.method === 'subscriptions/listen') return { jsonrpc: '2.0', id: message.id, result: { _meta: {} } }
+      return undefined
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'subscriptions/listen').length).toBeGreaterThan(1), {
+      timeout: 10000,
+    })
+
+    // And it stops, rather than reopening on a timer for the life of the process: a stream that
+    // ends the moment it opens is a server that does not hold one, however politely it answered
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'subscriptions/listen')).toHaveLength(5), {
+      timeout: 20000,
+    })
+    const opened = serverSent.filter((message) => message.method === 'subscriptions/listen').length
+    await new Promise((settle) => setTimeout(settle, 2500))
+    expect(serverSent.filter((message) => message.method === 'subscriptions/listen')).toHaveLength(opened)
+  }, 30000)
+
+  it('Scenario: Stop reopening a stream the server refused, rather than asking to be refused again', async () => {
+    const serverSent: any[] = []
+    const transportToClient = clientTransport([])
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') {
+        return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: { listChanged: true } }) }
+      }
+      if (message.method === 'subscriptions/listen') {
+        return { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } }
+      }
+      return undefined
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'subscriptions/listen')).toHaveLength(1))
+    await new Promise((settle) => setTimeout(settle, 100))
+    expect(serverSent.filter((message) => message.method === 'subscriptions/listen')).toHaveLength(1)
+  })
+
+  it('Scenario: A mid-request question is given the time an answer actually takes', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    // Sampling is a model call and elicitation is a person reading something; neither belongs on
+    // the budget written for the one request never expected to run long
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call') return undefined
+      if (message.params.inputResponses) return { jsonrpc: '2.0', id: message.id, result: { resultType: 'complete', content: [] } }
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'x' } } as any)
+
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.method === 'sampling/createMessage')).toHaveLength(1))
+    const question = clientSent.find((message) => message.method === 'sampling/createMessage')
+
+    // Well past the 30s an initialize is allowed, and the question is still open
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(clientSent.filter((message) => message.id === 'call-1')).toHaveLength(0)
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant' } })
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'call-1')).toHaveLength(1))
+    vi.useRealTimers()
+  })
+
+  it('Scenario: Settle what this proxy is waiting on when the connection goes, rather than holding a call open', async () => {
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call') return undefined
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'x' } } as any)
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.method === 'sampling/createMessage')).toHaveLength(1))
+
+    // The transport goes away while the question is still out
+    transportToServer.onclose?.()
+
+    // The client is told, rather than waiting out a ten-minute backstop for an answer that is
+    // never coming
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'call-1')).toHaveLength(1))
+    expect(clientSent.find((message) => message.id === 'call-1').error.message).toContain('connection closed')
+  })
+
+  it('Scenario: A tool the user hid stays hidden even when the answer arrives across a round trip', async () => {
+    // The filter lives in the response transformer, and the multi-round-trip path answers the
+    // client directly - so a server could have surfaced a hidden tool just by asking a question
+    // first. Which tools those are is exactly what the flag exists to keep from it.
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/list') return undefined
+      if (message.params.inputResponses) {
+        return { jsonrpc: '2.0', id: message.id, result: { resultType: 'complete', tools: [{ name: 'keepme' }, { name: 'secret' }] } }
+      }
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: ['secret'], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'list-1', params: {} } as any)
+
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.method === 'sampling/createMessage')).toHaveLength(1))
+    const question = clientSent.find((message) => message.method === 'sampling/createMessage')
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant' } })
+
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'list-1')).toHaveLength(1))
+    expect(clientSent.find((message) => message.id === 'list-1').result.tools).toEqual([{ name: 'keepme' }])
+  })
+
+  it('Scenario: A handshake repeated before the probe answers does not start a second bridge', async () => {
+    // A client whose own handshake timeout is shorter than the probe's does exactly this
+    const serverSent: any[] = []
+    const transportToClient = clientTransport([])
+    const transportToServer: any = {
+      send: vi.fn(async (message: any) => {
+        serverSent.push(message)
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      setProtocolVersion: vi.fn(),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    }
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    transportToClient.onmessage?.({ ...INITIALIZE, id: 'init-2' } as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'server/discover')).toHaveLength(1))
+    await new Promise((settle) => setTimeout(settle, 50))
+    expect(serverSent.filter((message) => message.method === 'server/discover')).toHaveLength(1)
+  })
+
+  it('Scenario: A server asking for input but naming none does not get the tool run again', async () => {
+    // The retry would be byte-identical to the request that produced it, so the tool would simply
+    // run once per round - ten more side effects for a server that answered nothing
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call') return undefined
+      return { jsonrpc: '2.0', id: message.id, result: { resultType: 'input_required' } }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'sendEmail' } } as any)
+
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'call-1')).toHaveLength(1))
+    expect(serverSent.filter((message) => message.method === 'tools/call')).toHaveLength(1)
+    expect(clientSent.find((message) => message.id === 'call-1').error.message).toContain('named none')
+  })
+
+  it('Scenario: A client is not asked for something it never said it could do', async () => {
+    // INITIALIZE declares `sampling` only, so a roots question has no business reaching it
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call') return undefined
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'roots/list', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'x' } } as any)
+
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'call-1')).toHaveLength(1))
+    expect(clientSent.filter((message) => message.method === 'roots/list')).toHaveLength(0)
+    expect(clientSent.find((message) => message.id === 'call-1').error.message).toContain('did not declare')
+  })
+
+  it('Scenario: A client request that borrows this proxy own id namespace is refused, not swallowed', async () => {
+    // Consuming it here would leave the client waiting on an answer that never comes
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, () => undefined)
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [] })
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'mcp-remote-own-1', params: {} } as any)
+
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    expect(clientSent[0].error.code).toBe(-32600)
+    expect(serverSent.filter((message) => message.method === 'tools/list')).toHaveLength(0)
+  })
+
   it('Scenario: A question this proxy cannot put to a 2025-era client is reported, not dropped', async () => {
     const clientSent: any[] = []
     const transportToClient = clientTransport(clientSent)

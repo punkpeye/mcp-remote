@@ -68,10 +68,13 @@ export type EraVerdict =
  * error the proof that a modern server answered, so anything outside this set - a `-32601` for an
  * unknown method, an HTTP-level failure, a parse error - is a legacy server saying it has never
  * heard of `server/discover`.
+ *
+ * Only `-32022` qualifies. The other two reserved codes describe a request rather than an era:
+ * `-32020` says the headers and body disagree and `-32021` says the client declared too little, and
+ * neither tells us which era answered. Treating them as evidence would report a version problem for
+ * something that is not one, and end the connection over it.
  */
 const MODERN_ERROR_CODES = new Set([
-  -32020, // HeaderMismatch
-  -32021, // MissingRequiredClientCapability
   -32022, // UnsupportedProtocolVersion
 ])
 
@@ -89,22 +92,33 @@ export function discoverRequest(id: string, identity: LegacyClientIdentity, vers
 export function readEraFromDiscoverResponse(message: { result?: unknown; error?: { code?: number; data?: unknown } }): EraVerdict {
   if (message.error) {
     const { code } = message.error
-    if (code !== undefined && MODERN_ERROR_CODES.has(code)) {
-      // A modern server that will not speak any revision we know. Falling back to `initialize`
-      // would be worse than failing: it cannot work, and it would hide why.
-      const supported = (message.error.data as { supported?: string[] } | undefined)?.supported
-      const version = supported && chooseModernVersion(supported)
-      if (!version) {
-        return {
-          era: 'incompatible',
-          reason: `the server is on the 2026-07-28 era but offers no revision this proxy speaks${
-            supported ? ` (it offers ${supported.join(', ')})` : ''
-          }`,
-        }
-      }
+    if (code === undefined || !MODERN_ERROR_CODES.has(code)) {
+      return { era: 'legacy', reason: `the server answered server/discover with error ${code}` }
+    }
+
+    const supported = parseSupportedVersions(message.error.data)
+    const version = supported && chooseModernVersion(supported)
+    if (version) {
+      // The probe already offered this, so being asked for it again is a server we cannot follow
       return { era: 'incompatible', reason: `the server asked for protocol version ${version}, which the probe already offered` }
     }
-    return { era: 'legacy', reason: `the server answered server/discover with error ${code}` }
+
+    // A server offering a pre-2026 revision is one the local client may well speak natively, and
+    // the handshake it was about to send is exactly how it would find out. Falling back there is
+    // the answer the compatibility matrix gives, not a guess.
+    if (!supported || supported.some((offered) => offered < FIRST_MODERN_PROTOCOL_VERSION)) {
+      return {
+        era: 'legacy',
+        reason: `the server offers no modern revision this proxy speaks${supported ? ` (it offers ${supported.join(', ')})` : ''}`,
+      }
+    }
+
+    // Every revision it offers is newer than anything here, and none of them is one the client
+    // could fall back to. Saying so beats a handshake that can only fail less legibly.
+    return {
+      era: 'incompatible',
+      reason: `the server offers ${supported.join(', ')}, and this proxy speaks ${SUPPORTED_MODERN_VERSIONS.join(', ')}`,
+    }
   }
 
   const parsed = DiscoverResultSchema.safeParse(message.result)
@@ -112,7 +126,10 @@ export function readEraFromDiscoverResponse(message: { result?: unknown; error?:
     return { era: 'legacy', reason: 'the server answered server/discover with something that is not a DiscoverResult' }
   }
 
-  const discover = parsed.data as DiscoverResult
+  // Parsed to validate, but the server's own object is what gets carried forward: capabilities are
+  // explicitly not a closed set, and the schema strips every key it does not know about - including
+  // the vendor capabilities a client may well understand
+  const discover = { ...(parsed.data as DiscoverResult), capabilities: (message.result as DiscoverResult).capabilities }
   const version = chooseModernVersion(discover.supportedVersions)
   if (!version) {
     return {
@@ -127,6 +144,20 @@ export function readEraFromDiscoverResponse(message: { result?: unknown; error?:
 /** The newest revision both sides know, or undefined if there is no overlap. */
 function chooseModernVersion(supportedVersions: string[]): string | undefined {
   return SUPPORTED_MODERN_VERSIONS.find((candidate) => supportedVersions.includes(candidate))
+}
+
+/**
+ * The `supported` list out of an error's `data`, if it is really a list of revisions.
+ *
+ * It arrives from the server, so it is checked rather than trusted: a bare string would otherwise
+ * match by substring, and a number would throw somewhere far less obvious than here.
+ */
+function parseSupportedVersions(data: unknown): string[] | undefined {
+  const supported = (data as { supported?: unknown } | undefined)?.supported
+  if (!Array.isArray(supported)) return undefined
+
+  const versions = supported.filter((entry): entry is string => typeof entry === 'string')
+  return versions.length > 0 ? versions : undefined
 }
 
 /**
@@ -198,7 +229,7 @@ export function stampModernMeta<T extends { params?: any }>(
  * collect an error for a liveness check that was always meant to be cheap. Answering it here is
  * honest, because in a stateless era there is no session whose liveness could be in doubt.
  */
-const ANSWERED_LOCALLY: Record<string, Record<string, unknown>> = { ping: {} }
+const ANSWERED_LOCALLY: Record<string, Record<string, unknown>> = Object.assign(Object.create(null), { ping: {} })
 
 export const localAnswerFor = (method: string): Record<string, unknown> | undefined => ANSWERED_LOCALLY[method]
 
@@ -357,4 +388,40 @@ export function inputRequiredRetryParams(originalParams: any, responses: Record<
  */
 const FULFILLABLE_INPUT_METHODS = new Set(['sampling/createMessage', 'roots/list', 'elicitation/create'])
 
-export const canFulfilInputRequest = (method: string): boolean => FULFILLABLE_INPUT_METHODS.has(method)
+/**
+ * Whether an embedded question can be put to a 2025-era client as it stands.
+ *
+ * The three methods survive the era change unchanged - except for one shape. URL-mode elicitation is
+ * a 2026 addition: the revision that introduced it also removed the `elicitationId` that
+ * `2025-11-25` requires, along with the `notifications/elicitation/complete` channel that id keyed.
+ * Forwarded as it arrives it is a request the client's own SDK rejects as invalid, with no way to
+ * report completion even if it did not - so it is refused here, where the reason can be said.
+ */
+export function canFulfilInputRequest(method: string, params?: unknown): boolean {
+  if (!FULFILLABLE_INPUT_METHODS.has(method)) return false
+  if (method === 'elicitation/create' && (params as { mode?: string } | undefined)?.mode === 'url') return false
+  return true
+}
+
+/** The capability a client must have declared before it can be asked one of these questions. */
+const CAPABILITY_FOR_INPUT_METHOD: Record<string, string> = Object.assign(Object.create(null), {
+  'sampling/createMessage': 'sampling',
+  'roots/list': 'roots',
+  'elicitation/create': 'elicitation',
+})
+
+/**
+ * Whether the client said, in its handshake, that it can answer this kind of question.
+ *
+ * A 2025-era server had to read that declaration before sending one of these; moving the question
+ * into a result does not license skipping it. Asking regardless only earns a `-32601` that then
+ * fails the tool call the client actually wanted.
+ */
+export function clientDeclaredCapabilityFor(method: string, capabilities: Record<string, unknown> | undefined): boolean {
+  const required = CAPABILITY_FOR_INPUT_METHOD[method]
+  if (!required) return false
+  return capabilities?.[required] !== undefined
+}
+
+/** How many questions a server may embed in one answer before this refuses to relay them. */
+export const MAX_INPUT_REQUESTS_PER_ROUND = 8

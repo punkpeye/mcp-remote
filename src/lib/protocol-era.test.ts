@@ -38,15 +38,33 @@ describe('Feature: Deciding which protocol era a server belongs to', () => {
     expect(verdict.era).toBe('legacy')
   })
 
-  it('Scenario: A modern error code is a modern server, not a reason to fall back', () => {
-    // The spec makes a recognised modern error the proof that a modern server answered, so falling
-    // back to `initialize` here would send a handshake to a server that cannot answer one
-    const verdict = readEraFromDiscoverResponse({
-      error: { code: -32022, data: { supported: ['2027-01-01'] } },
-    })
+  it('Scenario: A server offering only revisions newer than any here is reported, not handshaked at', () => {
+    const verdict = readEraFromDiscoverResponse({ error: { code: -32022, data: { supported: ['2027-01-01'] } } })
 
     expect(verdict.era).toBe('incompatible')
     expect((verdict as { reason: string }).reason).toContain('2027-01-01')
+  })
+
+  it('Scenario: A server that also speaks a pre-2026 revision gets the handshake the client had ready', () => {
+    // The compatibility matrix's working cell: this proxy cannot speak 2027 modernly, but the local
+    // client speaks 2025-11-25 natively, and its `initialize` is how it says so
+    const verdict = readEraFromDiscoverResponse({ error: { code: -32022, data: { supported: ['2027-01-01', '2025-11-25'] } } })
+
+    expect(verdict.era).toBe('legacy')
+  })
+
+  it('Scenario: A header or capability complaint is not evidence about which era answered', () => {
+    // -32020 says the headers and body disagree; -32021 says the client declared too little. Ending
+    // the connection over either would report a version problem that is not one.
+    expect(readEraFromDiscoverResponse({ error: { code: -32020 } }).era).toBe('legacy')
+    expect(readEraFromDiscoverResponse({ error: { code: -32021 } }).era).toBe('legacy')
+  })
+
+  it('Scenario: A supported list that is not a list of revisions is not read as one', () => {
+    // It comes from the server, so a bare string must not match by substring
+    const verdict = readEraFromDiscoverResponse({ error: { code: -32022, data: { supported: '2026-07-28' } } })
+
+    expect(verdict.era).toBe('legacy')
   })
 
   it('Scenario: A modern server offering only revisions this proxy cannot speak is reported, not bridged', () => {
