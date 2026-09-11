@@ -19,6 +19,9 @@ import {
   isModernOnlyNotification,
   clientDeclaredCapabilityFor,
   MAX_INPUT_REQUESTS_PER_ROUND,
+  RETIRED_IN_MODERN_ERA,
+  stampLogLevel,
+  unacknowledgedSubscriptions,
   localAnswerFor,
   MAX_INPUT_REQUIRED_ROUNDS,
   readEraFromDiscoverResponse,
@@ -325,13 +328,16 @@ export function debugLog(message: string, ...args: any[]) {
 
     // Ensure config directory exists
     const configDir = getConfigDir()
-    fs.mkdirSync(configDir, { recursive: true })
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 })
 
     // Append to log file
     const logPath = path.join(configDir, `${serverUrlHash}_debug.log`)
     const logMessage = `${formattedMessage} ${args.map((arg) => (typeof arg === 'object' ? JSON.stringify(arg) : String(arg))).join(' ')}\n`
 
-    fs.appendFileSync(logPath, logMessage, { encoding: 'utf8' })
+    // Same 0600 the token store uses. What lands here is whatever a debug line was given, and some
+    // of those carry a whole token response - so the copy in the log has to be as private as the
+    // copy in `tokens.json`, not world-readable beside it.
+    fs.appendFileSync(logPath, logMessage, { encoding: 'utf8', mode: 0o600 })
   } catch (error) {
     // Fallback to console if file logging fails
     console.error(`[DEBUG LOG ERROR] ${error}`)
@@ -537,6 +543,14 @@ export function mcpProxy({
   let clientIdentity: LegacyClientIdentity = {}
   /** In-flight `server/discover` probe. Everything the client sends queues behind it. */
   let eraNegotiation: Promise<void> | null = null
+  /** Resources the client subscribed to, which the modern era carries on the listen stream instead. */
+  const subscribedResources = new Set<string>()
+  /** The minimum log level the client asked for, which the modern era carries per request instead. */
+  let requestedLogLevel: string | undefined
+  /** Reopens the change-notification stream against a filter that has changed. */
+  let refreshSubscription: (() => void) | undefined
+  /** The remote-side id a client request is currently being retried under, for cancellation. */
+  const modernRetryIds = new Map<string | number, string>()
   let discoverSeq = 0
   const pendingDiscover = new Map<string, (message: Message) => void>()
   /**
@@ -725,6 +739,12 @@ export function mcpProxy({
 
     // Confirmation of a stream this proxy opened for the client, which the client never asked for
     if (era?.era === 'modern' && (_message as any).method && isModernOnlyNotification((_message as any).method)) {
+      const requested = subscriptionFilterFor(era.discover.capabilities, [...subscribedResources])
+      const missing = requested ? unacknowledgedSubscriptions(requested, (_message as any).params?.notifications) : []
+      if (missing.length > 0) {
+        // Otherwise a type the server quietly dropped is one the client waits for forever
+        log(`The remote server did not subscribe this client to: ${missing.join(', ')}`)
+      }
       debugLog('Consuming a notification that belongs to this proxy, not the client', { method: (_message as any).method })
       return
     }
@@ -735,7 +755,9 @@ export function mcpProxy({
       const original = modernOriginals.get(incomingId)
       if (original) {
         modernOriginals.delete(incomingId)
-        pendingRequests.delete(incomingId)
+        // Deliberately left in `pendingRequests`: the exchange is still owed an answer, and a
+        // dropped session has to be able to fail it rather than leave the client waiting out the
+        // whole leg timeout
         log('[Remote→Local]', `${incomingId} (asking for more input)`)
         driveInputRequired(original, (_message as any).result, era.version).catch((error: Error) => {
           onServerError(error)
@@ -751,6 +773,7 @@ export function mcpProxy({
     if (incomingId !== undefined && incomingId !== null) {
       pendingRequests.delete(incomingId)
       modernOriginals.delete(incomingId)
+      modernRetryIds.delete(incomingId)
     }
 
     // TODO: fix types
@@ -978,8 +1001,15 @@ export function mcpProxy({
    * @param timeoutMs How long to wait before giving up on an answer
    * @returns The response the remote sent
    */
-  function askRemote(build: (id: string) => Message, timeoutMs: number): Promise<Message> {
+  async function askRemote(build: (id: string) => Message, timeoutMs: number): Promise<Message> {
     const id = `mcp-remote-own-${++ownRequestSeq}`
+
+    // The same barrier `sendToServer` waits on. Without it a retry leg is POSTed onto the session
+    // that just went away, and the client waits out the full leg timeout for an answer that was
+    // never going to come.
+    if (sessionResumption) {
+      await sessionResumption
+    }
 
     return new Promise<Message>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1044,27 +1074,46 @@ export function mcpProxy({
    * failing to open it costs the client change notifications, not its session.
    */
   async function openChangeSubscription(version: string, capabilities: Record<string, unknown> | undefined) {
-    const notifications = subscriptionFilterFor(capabilities)
-    if (!notifications) {
-      debugLog('The server advertises no change notifications, so nothing is subscribed to')
-      return
-    }
+    // A `resources/subscribe` after the stream is open changes what should be on it. Reopening is
+    // the only way to say so, because the filter travels with the request that opened it.
+    let reopenNow: (() => void) | undefined
+    refreshSubscription = () => reopenNow?.()
 
     // A stream is not a session: it ends on a server restart, a load balancer's idle timeout, or a
     // network flake, and the client would go on believing nothing has changed since. Reopening is
     // the only thing that turns that back into a working subscription, because nothing below this
     // notices it stopped.
     for (let attempts = 0; attempts < SUBSCRIPTION_REOPEN_LIMIT; attempts++) {
+      const notifications = subscriptionFilterFor(capabilities, [...subscribedResources])
+      if (!notifications) {
+        // Nothing to listen for yet. A later `resources/subscribe` is what gives this a reason to
+        // exist, so this waits for one rather than giving up on the session.
+        debugLog('Nothing to subscribe to yet; waiting for the client to ask for something')
+        attempts = -1
+        if (!(await waitForSubscriptionChange())) return
+        continue
+      }
+
       const openedAt = Date.now()
 
       try {
         debugLog('Subscribing to change notifications on the client behalf', { notifications })
         // Resolves only when the stream ends, so this bounds a session's worth of notifications
         // rather than a request
-        const response = await askRemote(
-          (id) => subscriptionsListenRequest(id, clientIdentity, version, notifications) as Message,
-          SUBSCRIPTION_LIFETIME_MS,
-        )
+        const changed = new Promise<Message>((resolve) => {
+          reopenNow = () => resolve({ jsonrpc: '2.0', result: { reopen: true } } as Message)
+        })
+        const response = await Promise.race([
+          askRemote((id) => subscriptionsListenRequest(id, clientIdentity, version, notifications) as Message, SUBSCRIPTION_LIFETIME_MS),
+          changed,
+        ])
+        reopenNow = undefined
+
+        if ((response.result as { reopen?: boolean } | undefined)?.reopen) {
+          debugLog('Reopening the change-notification stream against a filter the client changed')
+          attempts = -1
+          continue
+        }
 
         if (response.error) {
           // A refusal is a decision, not a flake; reopening would only ask again and be told again
@@ -1093,6 +1142,29 @@ export function mcpProxy({
   }
 
   /**
+   * Waits until the client changes what it wants listened to, or the connection goes.
+   *
+   * @returns Whether there is still a connection worth reopening a stream on
+   */
+  function waitForSubscriptionChange(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const timer = setInterval(() => {
+        if (transportToClientClosed || transportToServerClosed) {
+          clearInterval(timer)
+          refreshSubscription = undefined
+          resolve(false)
+        }
+      }, SUBSCRIPTION_REOPEN_DELAY_MS)
+      timer.unref?.()
+
+      refreshSubscription = () => {
+        clearInterval(timer)
+        resolve(true)
+      }
+    })
+  }
+
+  /**
    * Answers a modern server that asked for more input before it could finish.
    *
    * The 2026-07-28 era turned the server's mid-request questions - sampling, elicitation, roots -
@@ -1117,6 +1189,10 @@ export function mcpProxy({
    * are is exactly what the remote server would have to control to arrange it.
    */
   function answerClient(message: Message) {
+    if (message.id !== undefined && message.id !== null) {
+      pendingRequests.delete(message.id)
+      modernRetryIds.delete(message.id)
+    }
     transportToClient.send(messageTransformer.interceptResponse(message)).catch(onClientError)
   }
 
@@ -1159,10 +1235,15 @@ export function mcpProxy({
       }
 
       const retryParams = inputRequiredRetryParams(original.params, responses, pending.requestState)
-      const reply = await askRemote(
-        (id) => stampModernMeta({ ...original, id, params: retryParams }, clientIdentity, version) as Message,
-        MULTI_ROUND_TRIP_LEG_TIMEOUT_MS,
-      )
+      const reply = await askRemote((id) => {
+        // Recorded so a `notifications/cancelled` naming the client's id can be re-addressed to the
+        // leg the server is actually running
+        modernRetryIds.set(original.id!, id)
+        return stampLogLevel(
+          stampModernMeta({ ...original, id, params: retryParams }, clientIdentity, version),
+          requestedLogLevel,
+        ) as Message
+      }, MULTI_ROUND_TRIP_LEG_TIMEOUT_MS)
 
       if (reply.error) {
         answerClient({ jsonrpc: '2.0', id: original.id, error: reply.error } as Message)
@@ -1299,8 +1380,31 @@ export function mcpProxy({
     }
 
     if (era?.era === 'modern' && message.method) {
+      // A cancellation names the id the client knows; the server is working under the id this proxy
+      // minted for the retry leg, so the notification has to be re-addressed or it cancels nothing
+      if (message.method === 'notifications/cancelled') {
+        const retryId = modernRetryIds.get(message.params?.requestId)
+        if (retryId !== undefined) {
+          debugLog('Re-addressing a cancellation to the leg the server is actually running', { retryId })
+          void sendToServer({ ...message, params: { ...message.params, requestId: retryId } })
+          return
+        }
+      }
+
       const answer = localAnswerFor(message.method)
       if (answer) {
+        // These are retired methods whose effect this proxy still owes the client
+        if (message.method === RETIRED_IN_MODERN_ERA.subscribeResource && typeof message.params?.uri === 'string') {
+          subscribedResources.add(message.params.uri)
+          refreshSubscription?.()
+        } else if (message.method === RETIRED_IN_MODERN_ERA.unsubscribeResource && typeof message.params?.uri === 'string') {
+          subscribedResources.delete(message.params.uri)
+          refreshSubscription?.()
+        } else if (message.method === RETIRED_IN_MODERN_ERA.setLogLevel && typeof message.params?.level === 'string') {
+          requestedLogLevel = message.params.level
+          debugLog('Recording the log level to carry on every later request', { level: requestedLogLevel })
+        }
+
         // A request is answered; the same method sent as a notification is simply dropped, because
         // there is nothing to answer and the server has no such method to forward it to
         if (message.id !== undefined && message.id !== null) {
@@ -1381,7 +1485,10 @@ export function mcpProxy({
 
     // Stamped here rather than in the transformer because the transformer runs the moment the
     // client's message arrives, which can be before the probe has said which era to speak.
-    const outgoing = era?.era === 'modern' && awaitsAnswer ? stampModernMeta(message, clientIdentity, era.version) : message
+    const outgoing =
+      era?.era === 'modern' && awaitsAnswer
+        ? stampLogLevel(stampModernMeta(message, clientIdentity, era.version), requestedLogLevel)
+        : message
 
     // Kept so that a server answering `input_required` can be retried with what the client sent
     if (era?.era === 'modern' && awaitsAnswer) modernOriginals.set(message.id!, message)
@@ -1484,6 +1591,7 @@ export function mcpProxy({
       transportToClient.send({ jsonrpc: '2.0', id, error: { code: -32001, message: `mcp-remote: ${reason}` } }).catch(onClientError)
       // Answered now, so there is nothing left to retry a multi-round-trip exchange for
       modernOriginals.delete(id)
+      modernRetryIds.delete(id)
     }
     pendingRequests.clear()
   }

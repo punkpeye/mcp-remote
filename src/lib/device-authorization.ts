@@ -211,10 +211,20 @@ export function applyClientAuthentication(
     return
   }
 
-  params.set('client_id', client_id)
-  if (method === 'client_secret_post' && client_secret) {
-    params.set('client_secret', client_secret)
+  if (method === 'client_secret_post') {
+    params.set('client_id', client_id)
+    if (client_secret) params.set('client_secret', client_secret)
+    return
   }
+
+  if (method !== 'none') {
+    // The SDK throws here rather than guessing, and so does this: falling through would send the
+    // client id alone and silently drop a secret the caller supplied, leaving a bare 401 as the
+    // only sign that the credential never went anywhere.
+    throw new Error(`Unsupported client authentication method: ${method}`)
+  }
+
+  params.set('client_id', client_id)
 }
 
 async function errorDetail(response: Response): Promise<string> {

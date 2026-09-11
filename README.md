@@ -395,7 +395,16 @@ The two modern surfaces with no `2025-11-25` equivalent are bridged as well:
   answered with. Capped at 10 rounds.
 
 A question this proxy cannot put to a 2025-era client — anything outside sampling, elicitation and
-roots — is reported as an error rather than dropped.
+roots, or a URL-mode elicitation, or one the client never declared it supports — is reported as an
+error rather than dropped.
+
+Three methods the modern era retired are honoured by `mcp-remote` itself rather than forwarded to a
+server that no longer has them, because the capabilities the client is handed still advertise them:
+
+- `resources/subscribe` / `resources/unsubscribe` become entries on the `subscriptions/listen`
+  stream, which is reopened whenever the set changes.
+- `logging/setLevel` is recorded and carried as the per-request `io.modelcontextprotocol/logLevel`
+  that replaced it — without which a modern server sends no logs at all.
 
 ### Static OAuth Client Metadata
 

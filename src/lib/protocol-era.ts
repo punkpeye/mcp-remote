@@ -1,6 +1,7 @@
 import { DiscoverResultSchema } from '@modelcontextprotocol/core'
 import {
   CLIENT_CAPABILITIES_META_KEY,
+  LOG_LEVEL_META_KEY,
   SUBSCRIPTION_ID_META_KEY,
   CLIENT_INFO_META_KEY,
   LATEST_PROTOCOL_VERSION,
@@ -200,6 +201,19 @@ export function synthesizeInitializeResult(discover: DiscoverResult, identity: L
  * @param version The revision being spoken to the remote server
  * @returns The same request with its `_meta` filled in
  */
+/**
+ * Adds the minimum log level a legacy client asked for, where the modern era reads it.
+ *
+ * `logging/setLevel` set it once for a session; the 2026-07-28 era has no session to set it on and
+ * reads it per request instead - and reads its absence as "send no logs at all", so a client that
+ * asked for logging and then got none would have no way to tell why.
+ */
+export function stampLogLevel<T extends { params?: any }>(message: T, logLevel: string | undefined): T {
+  if (!logLevel) return message
+
+  return { ...message, params: { ...message.params, _meta: { ...message.params?._meta, [LOG_LEVEL_META_KEY]: logLevel } } }
+}
+
 export function stampModernMeta<T extends { params?: any }>(
   message: T,
   identity: LegacyClientIdentity,
@@ -229,9 +243,25 @@ export function stampModernMeta<T extends { params?: any }>(
  * collect an error for a liveness check that was always meant to be cheap. Answering it here is
  * honest, because in a stateless era there is no session whose liveness could be in doubt.
  */
-const ANSWERED_LOCALLY: Record<string, Record<string, unknown>> = Object.assign(Object.create(null), { ping: {} })
+const ANSWERED_LOCALLY: Record<string, Record<string, unknown>> = Object.assign(Object.create(null), {
+  ping: {},
+  // The 2026-07-28 era replaced these with the `subscriptions/listen` stream this proxy already
+  // holds open, and with a per-request `_meta` key. The client still calls them, because the
+  // capabilities it was handed still advertise them - so they are honoured here rather than sent to
+  // a server that no longer has the methods.
+  'resources/subscribe': {},
+  'resources/unsubscribe': {},
+  'logging/setLevel': {},
+})
 
 export const localAnswerFor = (method: string): Record<string, unknown> | undefined => ANSWERED_LOCALLY[method]
+
+/** Methods the modern era retired, whose effect this proxy reproduces some other way. */
+export const RETIRED_IN_MODERN_ERA = {
+  subscribeResource: 'resources/subscribe',
+  unsubscribeResource: 'resources/unsubscribe',
+  setLogLevel: 'logging/setLevel',
+} as const
 
 /**
  * Notifications that mean nothing to a 2026-07-28 server, and so are dropped rather than forwarded.
@@ -240,7 +270,12 @@ export const localAnswerFor = (method: string): Record<string, unknown> | undefi
  * unknown method on the wire for no reason; the local client is never told, because from its side
  * the handshake did complete - this proxy answered it.
  */
-const DROPPED_NOTIFICATIONS = new Set(['notifications/initialized'])
+const DROPPED_NOTIFICATIONS = new Set([
+  'notifications/initialized',
+  // Not in the 2026-07-28 notification registry: the era carries client capabilities on every
+  // request instead, so a change to them is simply reflected in the next one this proxy stamps
+  'notifications/roots/list_changed',
+])
 
 export const isDroppedInModernEra = (method: string): boolean => DROPPED_NOTIFICATIONS.has(method)
 
@@ -303,7 +338,7 @@ export function translateModernResult(result: any): { result: any } | { error: {
  * @param capabilities What `server/discover` advertised
  * @returns The filter to listen with, or undefined if the server announces no changes at all
  */
-export function subscriptionFilterFor(capabilities: Record<string, unknown> | undefined) {
+export function subscriptionFilterFor(capabilities: Record<string, unknown> | undefined, resourceSubscriptions: string[] = []) {
   const tools = capabilities?.tools as { listChanged?: boolean } | undefined
   const prompts = capabilities?.prompts as { listChanged?: boolean } | undefined
   const resources = capabilities?.resources as { listChanged?: boolean } | undefined
@@ -312,9 +347,33 @@ export function subscriptionFilterFor(capabilities: Record<string, unknown> | un
     ...(tools?.listChanged ? { toolsListChanged: true } : {}),
     ...(prompts?.listChanged ? { promptsListChanged: true } : {}),
     ...(resources?.listChanged ? { resourcesListChanged: true } : {}),
+    ...(resourceSubscriptions.length > 0 ? { resourceSubscriptions } : {}),
   }
 
   return Object.keys(filter).length > 0 ? filter : undefined
+}
+
+/**
+ * What the server actually agreed to, compared with what was asked for.
+ *
+ * The spec has the client check the acknowledgment rather than assume it, because a server may
+ * honour only part of a filter - and a notification type it quietly dropped is one the client will
+ * wait for forever with nothing to say why.
+ *
+ * @returns The names of the notification types that were asked for and not acknowledged
+ */
+export function unacknowledgedSubscriptions(requested: Record<string, unknown>, acknowledged: unknown): string[] {
+  if (!acknowledged || typeof acknowledged !== 'object') return []
+
+  const granted = acknowledged as Record<string, unknown>
+  return Object.keys(requested).filter((key) => {
+    if (key === 'resourceSubscriptions') {
+      const asked = requested[key] as string[]
+      const got = Array.isArray(granted[key]) ? (granted[key] as string[]) : []
+      return asked.some((uri) => !got.includes(uri))
+    }
+    return !granted[key]
+  })
 }
 
 /** The `subscriptions/listen` request, written in the modern era like everything else. */

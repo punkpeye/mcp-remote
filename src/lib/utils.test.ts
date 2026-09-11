@@ -3419,6 +3419,106 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     expect(serverSent.filter((message) => message.method === 'tools/list')).toHaveLength(0)
   })
 
+  it('Scenario: A resource subscription is honoured through the stream that replaced it', async () => {
+    // The client is handed the server's capabilities verbatim, so it still calls a method the
+    // 2026-07-28 era deleted. Forwarding it would reach a server that has no such method.
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) =>
+      message.method === 'server/discover'
+        ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ resources: { subscribe: true } }) }
+        : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'resources/subscribe', id: 'sub-1', params: { uri: 'file:///a' } } as any)
+
+    // Answered here, and turned into the listen stream the era uses instead
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'sub-1')).toHaveLength(1))
+    expect(serverSent.filter((message) => message.method === 'resources/subscribe')).toHaveLength(0)
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'subscriptions/listen')).toHaveLength(1))
+    expect(serverSent.find((message) => message.method === 'subscriptions/listen').params.notifications.resourceSubscriptions).toEqual([
+      'file:///a',
+    ])
+  })
+
+  it('Scenario: A log level set once is carried on every request after it', async () => {
+    // The era has no session to hold it, and reads its absence as "send no logs at all"
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) =>
+      message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) } : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'logging/setLevel', id: 'log-1', params: { level: 'debug' } } as any)
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'log-1')).toHaveLength(1))
+    expect(serverSent.filter((message) => message.method === 'logging/setLevel')).toHaveLength(0)
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'list-1', params: {} } as any)
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'tools/list')).toHaveLength(1))
+    expect(serverSent.find((message) => message.method === 'tools/list').params._meta['io.modelcontextprotocol/logLevel']).toBe('debug')
+  })
+
+  it('Scenario: A notification the era dropped is not put on the wire', async () => {
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) =>
+      message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) } : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/roots/list_changed' } as any)
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/list', id: 'list-1', params: {} } as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'tools/list')).toHaveLength(1))
+    expect(serverSent.filter((message) => message.method === 'notifications/roots/list_changed')).toHaveLength(0)
+  })
+
+  it('Scenario: A cancellation reaches the leg the server is actually running', async () => {
+    // Mid-exchange the server is working under an id this proxy minted, not the client's
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call' || message.params.inputResponses) return undefined
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: {} } } },
+      }
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'x' } } as any)
+
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.method === 'sampling/createMessage')).toHaveLength(1))
+    const question = clientSent.find((message) => message.method === 'sampling/createMessage')
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant' } })
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'tools/call')).toHaveLength(2))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'call-1' } } as any)
+
+    await vi.waitFor(() => expect(serverSent.filter((message) => message.method === 'notifications/cancelled')).toHaveLength(1))
+    const retryId = serverSent.filter((message) => message.method === 'tools/call')[1].id
+    expect(serverSent.find((message) => message.method === 'notifications/cancelled').params.requestId).toBe(retryId)
+  })
+
   it('Scenario: A question this proxy cannot put to a 2025-era client is reported, not dropped', async () => {
     const clientSent: any[] = []
     const transportToClient = clientTransport(clientSent)
