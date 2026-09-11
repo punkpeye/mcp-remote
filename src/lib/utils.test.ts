@@ -3717,14 +3717,18 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     )
   }, 25000)
 
-  it('Scenario: A dropped session answers an exchange once, even when it later completes', async () => {
-    // The exchange keeps running after the session fails it, and used to answer a second time
+  it('Scenario: A superseded exchange does not answer the request that replaced it', async () => {
+    // A request id is the client's to reuse. An exchange stranded by a cancellation can still be
+    // running under an id the client has since sent again - and without something to tell the two
+    // apart, the stale one answers the new request, or the new one is mistaken for the stale one
+    // and dropped, leaving the client with nothing at all.
     const clientSent: any[] = []
     const serverSent: any[] = []
     const transportToClient = clientTransport(clientSent)
     const transportToServer = serverTransport(serverSent, (message: any) => {
       if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
-      if (message.method !== 'tools/call' || message.params.inputResponses) return undefined
+      if (message.method !== 'tools/call') return undefined
+      if (message.params.inputResponses) return undefined
       return {
         jsonrpc: '2.0',
         id: message.id,
@@ -3735,22 +3739,40 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
 
     transportToClient.onmessage?.(INITIALIZE as any)
     await vi.waitFor(() => expect(clientSent).toHaveLength(1))
-    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'x' } } as any)
+
+    // The first exchange starts, and is then abandoned
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'X', params: { name: 'first' } } as any)
     await vi.waitFor(() => expect(clientSent.filter((m) => m.method === 'sampling/createMessage')).toHaveLength(1))
+    const firstQuestion = clientSent.find((m) => m.method === 'sampling/createMessage')
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'X' } } as any)
 
-    // The session drops while the question is still out with the client
-    ;(transportToServer as any).onStreamReconnect?.()
-    await vi.waitFor(() => expect(clientSent.filter((m) => m.id === 'call-1')).toHaveLength(1))
+    // The client reuses the id for a new call, which runs an exchange of its own
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'X', params: { name: 'second' } } as any)
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.method === 'sampling/createMessage')).toHaveLength(2))
+    const secondQuestion = clientSent.filter((m) => m.method === 'sampling/createMessage')[1]
 
-    // The client answers anyway, the exchange finishes, and the server answers the retry
-    const question = clientSent.find((m) => m.method === 'sampling/createMessage')
-    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant' } })
-    await new Promise((settle) => setTimeout(settle, 200))
-    const retry = serverSent.filter((m) => m.method === 'tools/call')[1]
-    if (retry) transportToServer.onmessage?.({ jsonrpc: '2.0', id: retry.id, result: { resultType: 'complete', content: [] } })
+    // The second exchange finishes first
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: secondQuestion.id, result: { role: 'assistant' } })
+    await vi.waitFor(() => expect(serverSent.filter((m) => m.params?.inputResponses)).toHaveLength(1))
+    const secondRetry = serverSent.find((m) => m.params?.inputResponses)
+    transportToServer.onmessage?.({ jsonrpc: '2.0', id: secondRetry.id, result: { resultType: 'complete', content: [{ text: 'SECOND' }] } })
 
+    // The client is answered, once, by the exchange that actually speaks for this id
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.id === 'X')).toHaveLength(1))
+    expect(clientSent.find((m) => m.id === 'X').result.content).toEqual([{ text: 'SECOND' }])
+
+    // Now the stranded first exchange finishes
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: firstQuestion.id, result: { role: 'assistant' } })
     await new Promise((settle) => setTimeout(settle, 100))
-    expect(clientSent.filter((m) => m.id === 'call-1')).toHaveLength(1)
+    const firstRetry = serverSent.filter((m) => m.params?.inputResponses)[1]
+    if (firstRetry) {
+      transportToServer.onmessage?.({ jsonrpc: '2.0', id: firstRetry.id, result: { resultType: 'complete', content: [{ text: 'FIRST' }] } })
+    }
+
+    // And says nothing: the client already has its answer, and it is not this one
+    await new Promise((settle) => setTimeout(settle, 100))
+    expect(clientSent.filter((m) => m.id === 'X')).toHaveLength(1)
+    expect(clientSent.find((m) => m.id === 'X').result.content).toEqual([{ text: 'SECOND' }])
   }, 20000)
 
   it('Scenario: Reopening a stream while a session is recovering does not take the process down', async () => {
@@ -3788,30 +3810,41 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     }
   }, 20000)
 
-  it('Scenario: A dropped session does not hold an ordinary request id against a later answer', async () => {
-    // Only an exchange still running can answer twice. Holding every id a dropped session failed
-    // would silence a later, unrelated request that happened to reuse one.
+  it('Scenario: Cancelling before the server has anything in flight still ends the exchange', async () => {
+    // During the first round the question is out with the client and the server is waiting on
+    // nothing, so there is no leg to re-address the cancellation to - but the exchange will still
+    // finish, and must not answer a request the client has abandoned
     const clientSent: any[] = []
+    const serverSent: any[] = []
     const transportToClient = clientTransport(clientSent)
-    const transportToServer = serverTransport([], (message: any) =>
-      message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) } : undefined,
-    )
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call' || message.params.inputResponses) return undefined
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: {} } } },
+      }
+    })
     mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
 
     transportToClient.onmessage?.(INITIALIZE as any)
     await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'x' } } as any)
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.method === 'sampling/createMessage')).toHaveLength(1))
+    const question = clientSent.find((m) => m.method === 'sampling/createMessage')
 
-    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'reused', params: { name: 'x' } } as any)
-    ;(transportToServer as any).onStreamReconnect?.()
-    await vi.waitFor(() => expect(clientSent.filter((m) => m.id === 'reused')).toHaveLength(1))
+    // Cancelled while the question is still out - no retry leg exists yet
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'call-1' } } as any)
 
-    // The same id comes round again on a healthy connection
-    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'reused', params: { name: 'x' } } as any)
-    await new Promise((settle) => setTimeout(settle, 50))
-    transportToServer.onmessage?.({ jsonrpc: '2.0', id: 'reused', result: { resultType: 'complete', content: [] } })
+    // The client answers anyway and the exchange runs to completion
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant' } })
+    await new Promise((settle) => setTimeout(settle, 100))
+    const retry = serverSent.find((m) => m.params?.inputResponses)
+    if (retry) transportToServer.onmessage?.({ jsonrpc: '2.0', id: retry.id, result: { resultType: 'complete', content: [] } })
 
-    await vi.waitFor(() => expect(clientSent.filter((m) => m.id === 'reused')).toHaveLength(2))
-    expect(clientSent.filter((m) => m.id === 'reused')[1].result).toEqual({ content: [] })
+    await new Promise((settle) => setTimeout(settle, 100))
+    expect(clientSent.filter((m) => m.id === 'call-1')).toHaveLength(0)
   }, 20000)
 
   it('Scenario: A question this proxy cannot put to a 2025-era client is reported, not dropped', async () => {

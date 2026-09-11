@@ -563,16 +563,19 @@ export function mcpProxy({
   let dropResourceSubscriptions = false
   /** The remote-side id a client request is currently being retried under, for cancellation. */
   const modernRetryIds = new Map<string | number, string>()
-  /** Exchanges the client has cancelled, whose eventual answer is no longer wanted. */
-  const cancelledExchanges = new Set<string | number>()
   /**
-   * Multi-round-trip exchanges still running.
+   * The multi-round-trip exchange currently answering for each client request id, by token.
    *
-   * The only requests that can still answer after something else has failed them - an ordinary
-   * request is finished the moment its answer is forwarded. Silencing anything else would mean
-   * holding an id forever against a second answer that cannot come.
+   * A token rather than a flag, because a request id is the client's to reuse: an exchange stranded
+   * by a dropped session can still be running under an id the client has since sent again, and
+   * without something to tell the two apart the stale one answers the new request - or the new one
+   * is mistaken for the stale one and dropped, leaving the client with nothing.
+   *
+   * An entry exists only while an exchange is live. Every path that answers the client removes it,
+   * so a stale exchange finds its token gone and stays quiet.
    */
-  const runningExchanges = new Set<string | number>()
+  const liveExchanges = new Map<string | number, number>()
+  let exchangeSeq = 0
   let discoverSeq = 0
   const pendingDiscover = new Map<string, (message: Message) => void>()
   /**
@@ -802,16 +805,16 @@ export function mcpProxy({
         // dropped session has to be able to fail it rather than leave the client waiting out the
         // whole leg timeout
         log('[Remote→Local]', `${incomingId} (asking for more input)`)
-        runningExchanges.add(incomingId)
-        driveInputRequired(original, (_message as any).result, era.version).catch((error: Error) => {
+        const exchange = ++exchangeSeq
+        liveExchanges.set(incomingId, exchange)
+        driveInputRequired(original, (_message as any).result, era.version, exchange).catch((error: Error) => {
           onServerError(error)
           // Through `answerClient`, so the exchange stops being one a dropped session would fail a
           // second time - `replyWithError` answers but leaves it on the books
-          answerClient({
-            jsonrpc: '2.0',
-            id: original.id,
-            error: { code: -32001, message: `mcp-remote: ${error.message}` },
-          } as Message)
+          answerClient(
+            { jsonrpc: '2.0', id: original.id, error: { code: -32001, message: `mcp-remote: ${error.message}` } } as Message,
+            exchange,
+          )
         })
         // The transformer is still holding this request against a response that now arrives from
         // `answerClient` rather than from here
@@ -1064,9 +1067,13 @@ export function mcpProxy({
     // already able to reject - so a rejection arriving while this is still waiting below would
     // otherwise have no handler at all, which in Node is not a lost cancellation but a dead
     // process.
+    let cancelledBeforeSending = false
     let cancellation: unknown
     let abandon: ((reason: unknown) => void) | undefined
     cancelled?.catch((reason) => {
+      // A flag rather than the reason alone: a caller rejecting with `undefined` would otherwise
+      // read as "never cancelled", and the request would go out with nothing able to stop it
+      cancelledBeforeSending = true
       cancellation = reason
       abandon?.(reason)
     })
@@ -1079,7 +1086,7 @@ export function mcpProxy({
     }
 
     // Cancelled before it was ever sent, so there is nothing to tell the server about
-    if (cancellation !== undefined) throw cancellation
+    if (cancelledBeforeSending) throw cancellation
 
     return new Promise<Message>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1299,6 +1306,7 @@ export function mcpProxy({
    * @param original The request the client sent, which is what gets retried
    * @param firstResult The `input_required` result that started the exchange
    * @param version The revision being spoken to the remote server
+   * @param exchange The token this exchange answers under, so a superseded one stays quiet
    */
   /**
    * Answers the client's own request, through the same seam every other answer goes through.
@@ -1308,27 +1316,27 @@ export function mcpProxy({
    * multi-round-trip exchange would hand back the tools the user asked to hide. Which tools those
    * are is exactly what the remote server would have to control to arrange it.
    */
-  function answerClient(message: Message) {
+  function answerClient(message: Message, exchange?: number) {
     if (message.id !== undefined && message.id !== null) {
-      pendingRequests.delete(message.id)
-      modernRetryIds.delete(message.id)
-      runningExchanges.delete(message.id)
-
-      // Cancelled, or already answered by whatever failed the request first. Either way the client
-      // is not waiting on this any more, and a second response for one id is what makes its SDK
-      // complain about an unknown message id.
-      if (cancelledExchanges.delete(message.id)) {
-        debugLog('Dropping an answer to an exchange the client had already given up on', { id: message.id })
+      // Only the exchange still holding this id may answer it. One that was cancelled, or failed by
+      // a dropped session, or superseded by the client reusing the id, finds its token gone - and
+      // a second response for one id is what makes a client's SDK complain about an unknown id.
+      if (exchange !== undefined && liveExchanges.get(message.id) !== exchange) {
+        debugLog('Dropping an answer from an exchange that no longer speaks for this request', { id: message.id, exchange })
         // Called for its effect, not its result: it is what releases the transformer's hold on the
         // original request, which would otherwise be kept for the life of the process
         messageTransformer.interceptResponse(message)
         return
       }
+
+      pendingRequests.delete(message.id)
+      modernRetryIds.delete(message.id)
+      liveExchanges.delete(message.id)
     }
     transportToClient.send(messageTransformer.interceptResponse(message)).catch(onClientError)
   }
 
-  async function driveInputRequired(original: Message, firstResult: any, version: string) {
+  async function driveInputRequired(original: Message, firstResult: any, version: string, exchange: number) {
     let pending = firstResult
 
     for (let round = 0; round < MAX_INPUT_REQUIRED_ROUNDS; round++) {
@@ -1378,14 +1386,14 @@ export function mcpProxy({
       }, MULTI_ROUND_TRIP_LEG_TIMEOUT_MS)
 
       if (reply.error) {
-        answerClient({ jsonrpc: '2.0', id: original.id, error: reply.error } as Message)
+        answerClient({ jsonrpc: '2.0', id: original.id, error: reply.error } as Message, exchange)
         return
       }
 
       if (!isInputRequiredResult(reply.result)) {
         const translated = translateModernResult(reply.result)
         const answer = 'error' in translated ? { error: translated.error } : { result: translated.result }
-        answerClient({ jsonrpc: '2.0', id: original.id, ...answer } as Message)
+        answerClient({ jsonrpc: '2.0', id: original.id, ...answer } as Message, exchange)
         return
       }
 
@@ -1514,17 +1522,25 @@ export function mcpProxy({
     if (era?.era === 'modern' && message.method) {
       // A cancellation names the id the client knows; the server is working under the id this proxy
       // minted for the retry leg, so the notification has to be re-addressed or it cancels nothing
-      if (message.method === 'notifications/cancelled') {
-        const retryId = modernRetryIds.get(message.params?.requestId)
+      if (message.method === 'notifications/cancelled' && liveExchanges.has(message.params?.requestId)) {
+        const cancelledId = message.params.requestId
+
+        // Retired whether or not a leg is running yet: during the first round the question is out
+        // with the client and the server has nothing in flight, but the exchange will still finish
+        // and must not answer a request the client has abandoned.
+        liveExchanges.delete(cancelledId)
+        pendingRequests.delete(cancelledId)
+
+        // The server, meanwhile, knows the exchange by the id this proxy minted for the retry leg,
+        // so a notification naming the client's id would cancel nothing
+        const retryId = modernRetryIds.get(cancelledId)
         if (retryId !== undefined) {
           debugLog('Re-addressing a cancellation to the leg the server is actually running', { retryId })
-          // The exchange is no longer owed an answer, and one that arrives anyway must not be
-          // delivered to a client that has already moved on
-          cancelledExchanges.add(message.params.requestId)
-          pendingRequests.delete(message.params.requestId)
           void sendToServer({ ...message, params: { ...message.params, requestId: retryId } })
-          return
+        } else {
+          debugLog('Cancelling an exchange that has nothing in flight with the server yet', { id: cancelledId })
         }
+        return
       }
 
       const answer = localAnswerFor(message.method)
@@ -1730,9 +1746,9 @@ export function mcpProxy({
       // Answered now, so there is nothing left to retry a multi-round-trip exchange for
       modernOriginals.delete(id)
       modernRetryIds.delete(id)
-      // An exchange still running will answer this id again when it finishes, and has to be stopped
-      // from doing so. Nothing else can, so nothing else is held.
-      if (runningExchanges.has(id)) cancelledExchanges.add(id)
+      // An exchange still running would answer this id again when it finishes; retiring its token
+      // is what stops it, and costs nothing for an id no exchange is running under
+      liveExchanges.delete(id)
     }
     pendingRequests.clear()
   }
