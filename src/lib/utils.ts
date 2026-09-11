@@ -2338,7 +2338,7 @@ export async function connectToRemoteServer(
 
       // Wait for the authorization code from the callback
       debugLog('Waiting for auth code from callback server')
-      const { code, state } = await waitForAuthCode()
+      const { code, state, iss } = await waitForAuthCode()
       debugLog('Received auth code from callback server')
 
       // The code may belong to a flow another instance started, whose verifier is not this one's
@@ -2356,7 +2356,7 @@ export async function connectToRemoteServer(
         // Complete auth on the transport that received the 401 challenge (in proxy mode this is the
         // one-off test transport, not `transport`), so the stored resource_metadata URL is used to
         // discover the correct token_endpoint. Falls back to `transport` for the with-client path.
-        await (authChallengeTransport ?? transport).finishAuth(code)
+        await (authChallengeTransport ?? transport).finishAuth(code, iss)
         debugLog('Authorization completed successfully')
 
         // Track this reason for recursion
@@ -2487,6 +2487,7 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
   app.get(options.path, (req, res) => {
     const code = req.query.code as string | undefined
     const state = req.query.state as string | undefined
+    const iss = req.query.iss as string | undefined
     const authorizationError = req.query.error as string | undefined
     if (authorizationError) {
       const description = (req.query.error_description as string | undefined) ?? authorizationError
@@ -2500,7 +2501,7 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
       return
     }
 
-    const received: AuthCodeResult = { code, state }
+    const received: AuthCodeResult = { code, state, iss }
     authEverCompleted = true
     log('Auth code received, resolving promise')
     authCompletedResolve(received)

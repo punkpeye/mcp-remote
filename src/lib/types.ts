@@ -75,6 +75,13 @@ export interface OAuthCallbackServerOptions {
 export type AuthCodeResult = {
   code: string
   state?: string
+  /**
+   * The `iss` query parameter from the authorization callback (RFC 9207), if the
+   * authorization server sent one. Must reach `finishAuth` unchanged: when the
+   * server advertises `authorization_response_iss_parameter_supported: true`,
+   * the SDK client rejects a missing `iss` as a mix-up-attack indicator.
+   */
+  iss?: string
 }
 
 /*

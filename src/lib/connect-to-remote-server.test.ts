@@ -39,7 +39,7 @@ vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
   }
   class StreamableHTTPClientTransport {
     start = vi.fn().mockResolvedValue(undefined)
-    finishAuth = vi.fn(async (code: string) => {
+    finishAuth = vi.fn(async (code: string, _iss?: string) => {
       mockState.finishAuthCalls.push(code)
     })
     close = vi.fn().mockResolvedValue(undefined)
@@ -115,7 +115,7 @@ describe('connectToRemoteServer', () => {
     // The fix: finishAuth must run on the transport that actually handled the challenge,
     // so the stored resource_metadata URL drives token_endpoint discovery.
     expect(testTransport.finishAuth).toHaveBeenCalledTimes(1)
-    expect(testTransport.finishAuth).toHaveBeenCalledWith('auth-code-123')
+    expect(testTransport.finishAuth).toHaveBeenCalledWith('auth-code-123', undefined)
 
     // Regression guard: it must NOT be called on the main transport (which never saw the 401).
     expect(mainTransport.finishAuth).not.toHaveBeenCalled()
@@ -186,7 +186,21 @@ describe('connectToRemoteServer', () => {
     // transport is the main one, and finishAuth must run on it.
     const [mainTransport] = mockState.httpTransports
     expect(mainTransport.finishAuth).toHaveBeenCalledTimes(1)
-    expect(mainTransport.finishAuth).toHaveBeenCalledWith('auth-code-456')
+    expect(mainTransport.finishAuth).toHaveBeenCalledWith('auth-code-456', undefined)
+  })
+
+  it('forwards the callback iss to finishAuth for RFC 9207 validation (regression: IssuerMismatchError)', async () => {
+    // A server advertising `authorization_response_iss_parameter_supported: true` sends `iss` on
+    // the callback, and the SDK client rejects the exchange if it never reaches `finishAuth`.
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async () => ({ code: 'auth-code-iss', iss: 'https://mcp.example.com' }),
+      skipBrowserAuth: false,
+    })
+
+    await connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')
+
+    const [, testTransport] = mockState.httpTransports
+    expect(testTransport.finishAuth).toHaveBeenCalledWith('auth-code-iss', 'https://mcp.example.com')
   })
 
   // What `coordinateAuth` hands a secondary instance once a sibling has finished the browser flow:

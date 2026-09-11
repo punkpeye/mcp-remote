@@ -29,7 +29,7 @@ import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator, hasUsableTokens, serverIssuesAuthChallenge } from './lib/coordination'
 
 /** A transport that can redeem an authorization code, which the `Transport` interface does not promise. */
-type AuthCompletable = Transport & { finishAuth: (code: string) => Promise<void> }
+type AuthCompletable = Transport & { finishAuth: (code: string, iss?: string) => Promise<void> }
 
 const canFinishAuth = (transport: Transport): transport is AuthCompletable =>
   typeof (transport as Partial<AuthCompletable>).finishAuth === 'function'
@@ -202,7 +202,7 @@ async function runProxy(
           return
         }
 
-        const { code, state } = await waitForAuthCode()
+        const { code, state, iss } = await waitForAuthCode()
         // The code may belong to a flow another instance started, whose verifier is not this one's
         if (state) authProvider.useAuthorizationState(state)
 
@@ -210,7 +210,7 @@ async function runProxy(
         if (!canFinishAuth(remoteTransport)) {
           throw new Error(`${remoteTransport.constructor.name} cannot complete an authorization`)
         }
-        await remoteTransport.finishAuth(code)
+        await remoteTransport.finishAuth(code, iss)
         log('Re-authorized with the remote server')
       },
     })
