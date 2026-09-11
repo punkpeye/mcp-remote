@@ -565,6 +565,14 @@ export function mcpProxy({
   const modernRetryIds = new Map<string | number, string>()
   /** Exchanges the client has cancelled, whose eventual answer is no longer wanted. */
   const cancelledExchanges = new Set<string | number>()
+  /**
+   * Multi-round-trip exchanges still running.
+   *
+   * The only requests that can still answer after something else has failed them - an ordinary
+   * request is finished the moment its answer is forwarded. Silencing anything else would mean
+   * holding an id forever against a second answer that cannot come.
+   */
+  const runningExchanges = new Set<string | number>()
   let discoverSeq = 0
   const pendingDiscover = new Map<string, (message: Message) => void>()
   /**
@@ -794,6 +802,7 @@ export function mcpProxy({
         // dropped session has to be able to fail it rather than leave the client waiting out the
         // whole leg timeout
         log('[Remote→Local]', `${incomingId} (asking for more input)`)
+        runningExchanges.add(incomingId)
         driveInputRequired(original, (_message as any).result, era.version).catch((error: Error) => {
           onServerError(error)
           // Through `answerClient`, so the exchange stops being one a dropped session would fail a
@@ -1051,12 +1060,26 @@ export function mcpProxy({
   async function askRemote(build: (id: string) => Message, timeoutMs: number, cancelled?: Promise<never>): Promise<Message> {
     const id = `mcp-remote-own-${++ownRequestSeq}`
 
+    // Attached before anything is awaited, and unconditionally. A caller hands `cancelled` over
+    // already able to reject - so a rejection arriving while this is still waiting below would
+    // otherwise have no handler at all, which in Node is not a lost cancellation but a dead
+    // process.
+    let cancellation: unknown
+    let abandon: ((reason: unknown) => void) | undefined
+    cancelled?.catch((reason) => {
+      cancellation = reason
+      abandon?.(reason)
+    })
+
     // The same barrier `sendToServer` waits on. Without it a retry leg is POSTed onto the session
     // that just went away, and the client waits out the full leg timeout for an answer that was
     // never going to come.
     if (sessionResumption) {
       await sessionResumption
     }
+
+    // Cancelled before it was ever sent, so there is nothing to tell the server about
+    if (cancellation !== undefined) throw cancellation
 
     return new Promise<Message>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1077,11 +1100,11 @@ export function mcpProxy({
         resolve(message)
       })
 
-      cancelled?.catch((reason) => {
+      abandon = (reason) => {
         release()
         transportToServer.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id } }).catch(() => {})
         reject(reason)
-      })
+      }
 
       transportToServer.send(build(id)).catch((error) => {
         release()
@@ -1188,6 +1211,10 @@ export function mcpProxy({
         )
 
         if (response.error) {
+          // A transport that has gone answers everything outstanding with an error, and that is not
+          // the server refusing anything
+          if (transportToClientClosed || transportToServerClosed) return
+
           if (!dropResourceSubscriptions && subscribedResources.size > 0) {
             // The filter named resources; the rest of it may still be perfectly acceptable
             log(`The remote server refused a subscription naming resources; listening for the rest: ${JSON.stringify(response.error)}`)
@@ -1285,6 +1312,7 @@ export function mcpProxy({
     if (message.id !== undefined && message.id !== null) {
       pendingRequests.delete(message.id)
       modernRetryIds.delete(message.id)
+      runningExchanges.delete(message.id)
 
       // Cancelled, or already answered by whatever failed the request first. Either way the client
       // is not waiting on this any more, and a second response for one id is what makes its SDK
@@ -1699,12 +1727,12 @@ export function mcpProxy({
     debugLog('Failing requests the dropped session can no longer answer', { ids: [...pendingRequests] })
     for (const id of pendingRequests) {
       transportToClient.send({ jsonrpc: '2.0', id, error: { code: -32001, message: `mcp-remote: ${reason}` } }).catch(onClientError)
-      // Answered now, so there is nothing left to retry a multi-round-trip exchange for - and an
-      // exchange still running has to be stopped from answering this id a second time when it
-      // eventually finishes
+      // Answered now, so there is nothing left to retry a multi-round-trip exchange for
       modernOriginals.delete(id)
       modernRetryIds.delete(id)
-      cancelledExchanges.add(id)
+      // An exchange still running will answer this id again when it finishes, and has to be stopped
+      // from doing so. Nothing else can, so nothing else is held.
+      if (runningExchanges.has(id)) cancelledExchanges.add(id)
     }
     pendingRequests.clear()
   }

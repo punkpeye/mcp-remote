@@ -3753,6 +3753,67 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     expect(clientSent.filter((m) => m.id === 'call-1')).toHaveLength(1)
   }, 20000)
 
+  it('Scenario: Reopening a stream while a session is recovering does not take the process down', async () => {
+    // The cancellation can arrive while `askRemote` is still parked on the session barrier, before
+    // it has anything listening for one. In Node an unhandled rejection is not a lost cancellation,
+    // it is a dead proxy - and this is an ordinary SSE reconnect plus two subscribes.
+    const unhandled: unknown[] = []
+    const record = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', record)
+
+    try {
+      const clientSent: any[] = []
+      const transportToClient = clientTransport(clientSent)
+      const transportToServer = serverTransport([], (message: any) =>
+        message.method === 'server/discover'
+          ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: { listChanged: true }, resources: {} }) }
+          : undefined,
+      )
+      mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+      transportToClient.onmessage?.(INITIALIZE as any)
+      await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+      // The stream comes back, so every later send waits on the handshake that repairs the session
+      ;(transportToServer as any).onStreamReconnect?.()
+
+      transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'resources/subscribe', id: 's1', params: { uri: 'file:///a' } } as any)
+      await new Promise((settle) => setTimeout(settle, 2600))
+      transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'resources/subscribe', id: 's2', params: { uri: 'file:///b' } } as any)
+      await new Promise((settle) => setTimeout(settle, 500))
+
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', record)
+    }
+  }, 20000)
+
+  it('Scenario: A dropped session does not hold an ordinary request id against a later answer', async () => {
+    // Only an exchange still running can answer twice. Holding every id a dropped session failed
+    // would silence a later, unrelated request that happened to reuse one.
+    const clientSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport([], (message: any) =>
+      message.method === 'server/discover' ? { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) } : undefined,
+    )
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'reused', params: { name: 'x' } } as any)
+    ;(transportToServer as any).onStreamReconnect?.()
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.id === 'reused')).toHaveLength(1))
+
+    // The same id comes round again on a healthy connection
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'reused', params: { name: 'x' } } as any)
+    await new Promise((settle) => setTimeout(settle, 50))
+    transportToServer.onmessage?.({ jsonrpc: '2.0', id: 'reused', result: { resultType: 'complete', content: [] } })
+
+    await vi.waitFor(() => expect(clientSent.filter((m) => m.id === 'reused')).toHaveLength(2))
+    expect(clientSent.filter((m) => m.id === 'reused')[1].result).toEqual({ content: [] })
+  }, 20000)
+
   it('Scenario: A question this proxy cannot put to a 2025-era client is reported, not dropped', async () => {
     const clientSent: any[] = []
     const transportToClient = clientTransport(clientSent)
