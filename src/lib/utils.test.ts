@@ -12,6 +12,7 @@ import {
   parseSecondsOption,
   parseAuthorizeParams,
   fetchWithMcpHeaders,
+  discoverOAuthServerInfo,
 } from './utils'
 import { getConfigDir } from './mcp-auth-config'
 import { Headers as UndiciHeaders } from 'undici'
@@ -178,6 +179,47 @@ describe('Feature: Command Line Arguments Parsing', () => {
     const result = await parseCommandLineArgs(['https://example.com/sse', '--client-credentials'], 'test usage')
 
     expect(result.useClientCredentials).toBe(true)
+  })
+
+  it('Scenario: Use an explicit token endpoint for client credentials without discovery', async () => {
+    const result = await parseCommandLineArgs(
+      ['https://example.com/mcp', '--client-credentials', '--token-endpoint', 'https://auth.example.com/oauth/token'],
+      'test usage',
+    )
+
+    expect(result.tokenEndpoint).toBe('https://auth.example.com/oauth/token')
+  })
+
+  it('Scenario: Refuse an explicit token endpoint for a user authorization flow', async () => {
+    await expect(
+      parseCommandLineArgs(['https://example.com/mcp', '--token-endpoint', 'https://auth.example.com/oauth/token'], 'test usage'),
+    ).rejects.toThrow('--client-credentials')
+  })
+
+  it('Scenario: Refuse to send client credentials to an insecure remote token endpoint', async () => {
+    await expect(
+      parseCommandLineArgs(
+        ['https://example.com/mcp', '--client-credentials', '--token-endpoint', 'http://auth.example.com/oauth/token'],
+        'test usage',
+      ),
+    ).rejects.toThrow('must use HTTPS')
+  })
+
+  it('Scenario: Skip OAuth discovery when a client-credentials token endpoint is explicit', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await discoverOAuthServerInfo('https://example.com/mcp', {}, 'https://auth.example.com/oauth/token')
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(result).toEqual({
+      authorizationServerUrl: 'https://auth.example.com',
+      authorizationServerMetadata: {
+        issuer: 'https://auth.example.com',
+        token_endpoint: 'https://auth.example.com/oauth/token',
+      },
+    })
+    vi.unstubAllGlobals()
   })
 
   it('Scenario: Take a client secret from the environment rather than the command line', async () => {
@@ -4197,6 +4239,27 @@ describe('Feature: Server URL Hash Generation', () => {
     const hash1 = getServerUrlHash('https://example.com', '')
     const hash2 = getServerUrlHash('https://example.com')
     expect(hash1).toBe(hash2)
+  })
+
+  it('Scenario: Keep credentials for explicit token endpoints apart', () => {
+    const first = getServerUrlHash(
+      'https://example.com/mcp',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'https://auth-a.example.com/token',
+    )
+    const second = getServerUrlHash(
+      'https://example.com/mcp',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'https://auth-b.example.com/token',
+    )
+
+    expect(first).not.toBe(second)
   })
 })
 

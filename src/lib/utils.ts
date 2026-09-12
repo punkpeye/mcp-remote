@@ -1872,7 +1872,26 @@ export interface OAuthServerDiscoveryResult {
 export async function discoverOAuthServerInfo(
   serverUrl: string,
   headers: Record<string, string> = {},
+  tokenEndpoint?: string,
 ): Promise<OAuthServerDiscoveryResult> {
+  // Machine-to-machine deployments sometimes have a token endpoint that is known to the
+  // operator but publish neither RFC 9728 protected-resource metadata nor RFC 8414/OIDC
+  // authorization-server metadata. An explicit endpoint is sufficient for client_credentials,
+  // and avoiding the discovery probes also avoids redirects to unrelated HTML error pages.
+  if (tokenEndpoint) {
+    const endpoint = new URL(tokenEndpoint)
+    debugLog('Using the explicitly configured token endpoint; skipping OAuth discovery', {
+      tokenEndpointOrigin: endpoint.origin,
+    })
+    return {
+      authorizationServerUrl: endpoint.origin,
+      authorizationServerMetadata: {
+        issuer: endpoint.origin,
+        token_endpoint: endpoint.toString(),
+      },
+    }
+  }
+
   debugLog('Starting OAuth server discovery', { serverUrl })
 
   let wwwAuthenticateHeader: string | undefined
@@ -2983,6 +3002,41 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     log('Using the OAuth client_credentials grant; no browser will be opened and no user will be asked')
   }
 
+  // Some internal authorization servers do not publish discovery metadata. The endpoint is
+  // accepted only for the non-interactive client_credentials grant: applying it to a browser or
+  // device flow would leave the authorization endpoint and issuer undefined.
+  let tokenEndpoint: string | undefined
+  const tokenEndpointIndex = args.indexOf('--token-endpoint')
+  if (tokenEndpointIndex !== -1) {
+    if (tokenEndpointIndex >= args.length - 1 || args[tokenEndpointIndex + 1].startsWith('--')) {
+      throw new Error('--token-endpoint requires an HTTPS URL')
+    }
+    if (!useClientCredentials) {
+      throw new Error('--token-endpoint can only be used with --client-credentials')
+    }
+
+    const value = args[tokenEndpointIndex + 1].trim()
+    let endpoint: URL
+    try {
+      endpoint = new URL(value)
+    } catch {
+      throw new Error('Invalid --token-endpoint value. Expected an HTTPS URL.')
+    }
+
+    const isLoopback =
+      endpoint.protocol === 'http:' &&
+      (endpoint.hostname === 'localhost' || endpoint.hostname === '127.0.0.1' || endpoint.hostname === '[::1]')
+    if (endpoint.protocol !== 'https:' && !isLoopback) {
+      throw new Error('--token-endpoint must use HTTPS, except for an HTTP loopback endpoint')
+    }
+    if (endpoint.username || endpoint.password || endpoint.hash) {
+      throw new Error('--token-endpoint must not contain credentials or a URL fragment')
+    }
+
+    tokenEndpoint = endpoint.toString()
+    log(`Using an explicit OAuth token endpoint at ${endpoint.origin}`)
+  }
+
   // Both finish inside the provider's redirect step, so neither has a code arriving at a port
   NON_INTERACTIVE_FLOW = useDeviceCode || useClientCredentials
 
@@ -3070,7 +3124,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     process.exit(1)
   }
   // Calculate hash with all parsed parameters for cache isolation
-  const serverUrlHash = getServerUrlHash(serverUrl, authorizeResource, headers, authorizeParams, clientMetadataUrl)
+  const serverUrlHash = getServerUrlHash(serverUrl, authorizeResource, headers, authorizeParams, clientMetadataUrl, tokenEndpoint)
 
   // Set server hash globally for debug logging
   global.currentServerUrlHash = serverUrlHash
@@ -3130,6 +3184,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     useIdToken,
     useDeviceCode,
     useClientCredentials,
+    tokenEndpoint,
     authorizeResource,
     skipResourceParameter,
     authorizeParams,
@@ -3170,6 +3225,7 @@ export function setupSignalHandlers(cleanup: () => Promise<void>) {
  * @param headers Optional custom headers
  * @param authorizeParams Optional extra authorization parameters
  * @param clientMetadataUrl Optional Client ID Metadata Document URL used as the client_id
+ * @param tokenEndpoint Optional explicit token endpoint used by the client_credentials grant
  * @returns MD5 hash of the configuration
  */
 export function getServerUrlHash(
@@ -3178,6 +3234,7 @@ export function getServerUrlHash(
   headers?: Record<string, string>,
   authorizeParams?: Record<string, string>,
   clientMetadataUrl?: string,
+  tokenEndpoint?: string,
 ): string {
   // Include resource and headers in hash to isolate OAuth sessions
   // per unique server configuration (fixes #25)
@@ -3198,6 +3255,9 @@ export function getServerUrlHash(
   // A refresh token is bound to the client that obtained it, so tokens from a dynamic registration
   // cannot be refreshed once this client starts identifying itself by a URL instead.
   if (clientMetadataUrl) parts.push(clientMetadataUrl)
+  // Client credentials and tokens are bound to the authorization server that issued them. A
+  // changed endpoint must never inherit a token cached for the same MCP resource server.
+  if (tokenEndpoint) parts.push(tokenEndpoint)
   return crypto.createHash('md5').update(parts.join('|')).digest('hex')
 }
 
