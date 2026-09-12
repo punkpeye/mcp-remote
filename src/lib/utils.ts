@@ -2338,7 +2338,7 @@ export async function connectToRemoteServer(
 
       // Wait for the authorization code from the callback
       debugLog('Waiting for auth code from callback server')
-      const { code, state } = await waitForAuthCode()
+      const { code, state, iss } = await waitForAuthCode()
       debugLog('Received auth code from callback server')
 
       // The code may belong to a flow another instance started, whose verifier is not this one's
@@ -2356,7 +2356,11 @@ export async function connectToRemoteServer(
         // Complete auth on the transport that received the 401 challenge (in proxy mode this is the
         // one-off test transport, not `transport`), so the stored resource_metadata URL is used to
         // discover the correct token_endpoint. Falls back to `transport` for the with-client path.
-        await (authChallengeTransport ?? transport).finishAuth(code)
+        // RFC 9207: pass `iss` so the SDK can validate the authorization server identity before
+        // exchanging the code. Using URLSearchParams keeps the call forward-compatible.
+        const authResponse = new URLSearchParams({ code })
+        if (iss) authResponse.set('iss', iss)
+        await (authChallengeTransport ?? transport).finishAuth(authResponse)
         debugLog('Authorization completed successfully')
 
         // Track this reason for recursion
@@ -2487,6 +2491,10 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
   app.get(options.path, (req, res) => {
     const code = req.query.code as string | undefined
     const state = req.query.state as string | undefined
+    // RFC 9207: authorization servers that support issuer identification append `iss` to the
+    // redirect. The MCP SDK validates it inside `finishAuth`; dropping it here causes an
+    // IssuerMismatchError even when the issuer is perfectly correct.
+    const iss = req.query.iss as string | undefined
     const authorizationError = req.query.error as string | undefined
     if (authorizationError) {
       const description = (req.query.error_description as string | undefined) ?? authorizationError
@@ -2500,7 +2508,7 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
       return
     }
 
-    const received: AuthCodeResult = { code, state }
+    const received: AuthCodeResult = { code, state, iss }
     authEverCompleted = true
     log('Auth code received, resolving promise')
     authCompletedResolve(received)

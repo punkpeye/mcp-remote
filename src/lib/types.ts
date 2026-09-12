@@ -71,10 +71,19 @@ export interface OAuthCallbackServerOptions {
   serverUrlHash: string
 }
 
-/** An authorization code, with the state identifying the flow it belongs to. */
+/**
+ * An authorization code, with the state and optional issuer identifying the flow it belongs to.
+ *
+ * `iss` carries the RFC 9207 `iss` parameter returned by authorization servers that include it
+ * in the redirect. The MCP SDK uses it to verify that the response came from the expected
+ * authorization server before exchanging the code. Dropping it causes an IssuerMismatchError
+ * when the server includes the parameter.
+ */
 export type AuthCodeResult = {
   code: string
   state?: string
+  /** RFC 9207 issuer identifier, when the authorization server includes it in the redirect. */
+  iss?: string
 }
 
 /*

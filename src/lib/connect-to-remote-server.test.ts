@@ -13,8 +13,10 @@ const mockState = vi.hoisted(() => ({
   connectFailuresRemaining: 1,
   // Number of remaining connects that should fail the way the SDK reports a refused fresh token.
   rejectedTokenFailuresRemaining: 0,
-  // Every authorization code handed to `finishAuth`, in order.
+  // Every authorization code handed to `finishAuth`, in order (extracted from the params).
   finishAuthCalls: [] as string[],
+  // The `iss` parameter passed to `finishAuth` alongside each code, parallel to finishAuthCalls.
+  finishAuthIssCalls: [] as Array<string | undefined>,
 }))
 
 vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
@@ -39,8 +41,12 @@ vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
   }
   class StreamableHTTPClientTransport {
     start = vi.fn().mockResolvedValue(undefined)
-    finishAuth = vi.fn(async (code: string) => {
+    finishAuth = vi.fn(async (params: URLSearchParams | string) => {
+      // Accept both URLSearchParams (RFC 9207-aware path) and plain string (legacy path).
+      const code = params instanceof URLSearchParams ? (params.get('code') ?? '') : params
+      const iss = params instanceof URLSearchParams ? (params.get('iss') ?? undefined) : undefined
       mockState.finishAuthCalls.push(code)
+      mockState.finishAuthIssCalls.push(iss)
     })
     close = vi.fn().mockResolvedValue(undefined)
     constructor(
@@ -89,6 +95,7 @@ describe('connectToRemoteServer', () => {
   beforeEach(() => {
     mockState.httpTransports.length = 0
     mockState.finishAuthCalls.length = 0
+    mockState.finishAuthIssCalls.length = 0
     mockState.connectFailuresRemaining = 1
     mockState.rejectedTokenFailuresRemaining = 0
     // Keep test output quiet; connectToRemoteServer logs to stderr.
@@ -115,7 +122,8 @@ describe('connectToRemoteServer', () => {
     // The fix: finishAuth must run on the transport that actually handled the challenge,
     // so the stored resource_metadata URL drives token_endpoint discovery.
     expect(testTransport.finishAuth).toHaveBeenCalledTimes(1)
-    expect(testTransport.finishAuth).toHaveBeenCalledWith('auth-code-123')
+    // The argument is now URLSearchParams; check the extracted code via the mock's own capture.
+    expect(mockState.finishAuthCalls).toEqual(['auth-code-123'])
 
     // Regression guard: it must NOT be called on the main transport (which never saw the 401).
     expect(mainTransport.finishAuth).not.toHaveBeenCalled()
@@ -186,7 +194,8 @@ describe('connectToRemoteServer', () => {
     // transport is the main one, and finishAuth must run on it.
     const [mainTransport] = mockState.httpTransports
     expect(mainTransport.finishAuth).toHaveBeenCalledTimes(1)
-    expect(mainTransport.finishAuth).toHaveBeenCalledWith('auth-code-456')
+    // The argument is now URLSearchParams; check the extracted code via the mock's own capture.
+    expect(mockState.finishAuthCalls).toEqual(['auth-code-456'])
   })
 
   // What `coordinateAuth` hands a secondary instance once a sibling has finished the browser flow:
@@ -262,5 +271,121 @@ describe('connectToRemoteServer', () => {
     )
 
     expect(mockState.finishAuthCalls).toEqual(['auth-code-789'])
+  })
+})
+
+// =============================================================================
+// RFC 9207 Authorization Server Issuer Identification — regression tests
+// =============================================================================
+// RFC 9207 (OAuth 2.0 Authorization Server Issuer Identification) requires that
+// authorization servers SHOULD include an `iss` parameter in the authorization
+// response. The MCP SDK v2 validates this parameter inside `finishAuth`, and
+// throws `IssuerMismatchError` when the `iss` it receives does not match the
+// server it sent the request to. mcp-remote was dropping `iss` from the OAuth
+// loopback callback, so `finishAuth` saw no issuer and raised IssuerMismatchError
+// even when the server supplied a perfectly correct one.
+
+describe('RFC 9207 – iss propagation through the OAuth loopback callback', () => {
+  beforeEach(() => {
+    mockState.httpTransports.length = 0
+    mockState.finishAuthCalls.length = 0
+    mockState.finishAuthIssCalls.length = 0
+    mockState.connectFailuresRemaining = 1
+    mockState.rejectedTokenFailuresRemaining = 0
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+  })
+
+  it('preserves iss from the authorization response and passes it to finishAuth (RFC 9207)', async () => {
+    // Simulate an authorization response that includes `iss` as required by RFC 9207.
+    // Real servers (e.g. api.sutra.sudarshanai.com) append `?code=...&state=...&iss=https%3A%2F%2F...`
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async (): Promise<AuthCodeResult> => ({
+        code: 'auth-code-rfc9207',
+        state: 'opaque-state-value',
+        iss: 'https://api.sutra.sudarshanai.com',
+      }),
+      skipBrowserAuth: false,
+    })
+
+    await connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')
+
+    // The code was passed through correctly.
+    expect(mockState.finishAuthCalls).toEqual(['auth-code-rfc9207'])
+
+    // The iss was preserved and forwarded – without this, IssuerMismatchError would be thrown
+    // by the SDK's RFC 9207 validation even when the issuer is correct.
+    expect(mockState.finishAuthIssCalls).toEqual(['https://api.sutra.sudarshanai.com'])
+  })
+
+  it('finishAuth receives a URLSearchParams with both code and iss set', async () => {
+    // The MCP SDK's preferred form for finishAuth is URLSearchParams.
+    // Verify the raw argument shape rather than just the captured scalars.
+    let capturedParams: unknown
+
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async (): Promise<AuthCodeResult> => ({
+        code: 'auth-code-urlparams',
+        iss: 'https://api.sutra.sudarshanai.com',
+      }),
+      skipBrowserAuth: false,
+    })
+
+    await connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')
+
+    // The test transport (index 1) is the one that receives the challenge and finishAuth
+    const [, testTransport] = mockState.httpTransports
+    const call = (testTransport.finishAuth as ReturnType<typeof vi.fn>).mock.calls[0]
+    capturedParams = call[0]
+
+    expect(capturedParams).toBeInstanceOf(URLSearchParams)
+    expect((capturedParams as URLSearchParams).get('code')).toBe('auth-code-urlparams')
+    expect((capturedParams as URLSearchParams).get('iss')).toBe('https://api.sutra.sudarshanai.com')
+  })
+
+  it('does not set iss in URLSearchParams when authorization response omits it (backward compat)', async () => {
+    // Servers that predate RFC 9207 (or that choose not to include iss) must still work.
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async (): Promise<AuthCodeResult> => ({
+        code: 'auth-code-no-iss',
+        // iss deliberately absent
+      }),
+      skipBrowserAuth: false,
+    })
+
+    await connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')
+
+    expect(mockState.finishAuthCalls).toEqual(['auth-code-no-iss'])
+    // iss must be absent (undefined), not an empty string, so the SDK treats it as missing.
+    expect(mockState.finishAuthIssCalls).toEqual([undefined])
+
+    // Confirm the URLSearchParams did NOT include an `iss` key at all.
+    const [, testTransport] = mockState.httpTransports
+    const call = (testTransport.finishAuth as ReturnType<typeof vi.fn>).mock.calls[0]
+    const params = call[0] as URLSearchParams
+    expect(params.has('iss')).toBe(false)
+  })
+
+  it('state handling remains intact when iss is also present (no regression)', async () => {
+    // The existing state-based PKCE flow must still work when iss is added alongside state.
+    const useAuthorizationState = vi.fn()
+    const authProvider = { useAuthorizationState } as any
+
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async (): Promise<AuthCodeResult> => ({
+        code: 'auth-code-with-state',
+        state: 'csrf-protection-token',
+        iss: 'https://api.sutra.sudarshanai.com',
+      }),
+      skipBrowserAuth: false,
+    })
+
+    await connectToRemoteServer(null, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first')
+
+    // State is still forwarded to the provider for PKCE / CSRF validation.
+    expect(useAuthorizationState).toHaveBeenCalledWith('csrf-protection-token')
+
+    // And iss is still forwarded to finishAuth for RFC 9207 validation.
+    expect(mockState.finishAuthIssCalls).toEqual(['https://api.sutra.sudarshanai.com'])
+    expect(mockState.finishAuthCalls).toEqual(['auth-code-with-state'])
   })
 })

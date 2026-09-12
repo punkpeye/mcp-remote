@@ -2800,6 +2800,65 @@ describe('setupOAuthCallbackServerWithLongPoll', () => {
   })
 })
 
+// ==========================================================================
+// RFC 9207 – OAuth `iss` parameter propagation regression tests
+// https://www.rfc-editor.org/rfc/rfc9207
+// ==========================================================================
+describe('setupOAuthCallbackServerWithLongPoll – RFC 9207 iss extraction', () => {
+  let rfc9207Server: import('http').Server | undefined
+  const rfc9207Events = new EventEmitter()
+
+  afterEach(async () => {
+    if (rfc9207Server) {
+      await new Promise<void>((resolve) => rfc9207Server!.close(() => resolve()))
+      rfc9207Server = undefined
+    }
+  })
+
+  it('RFC 9207: extracts iss from the redirect and includes it in AuthCodeResult', async () => {
+    // An authorization server conforming to RFC 9207 appends `iss` to the redirect:
+    // GET /callback?code=AUTH_CODE&state=STATE&iss=https%3A%2F%2Fapi.sutra.sudarshanai.com
+    // Without this fix the MCP SDK receives no issuer and throws IssuerMismatchError.
+    const result = await setupOAuthCallbackServerWithLongPoll({
+      port: 0,
+      path: '/oauth/callback',
+      events: rfc9207Events,
+      serverUrlHash: 'test-hash',
+    })
+    rfc9207Server = result.server
+
+    const base = `http://127.0.0.1:${result.actualPort}/oauth/callback`
+    await fetch(`${base}?code=rfc9207-code&state=opaque-state&iss=https%3A%2F%2Fapi.sutra.sudarshanai.com`)
+
+    const received = await result.waitForAuthCode()
+
+    expect(received.code).toBe('rfc9207-code')
+    expect(received.state).toBe('opaque-state')
+    expect(received.iss).toBe('https://api.sutra.sudarshanai.com')
+  })
+
+  it('RFC 9207: iss is absent when the authorization server does not include it (backward compat)', async () => {
+    // Servers that predate RFC 9207 do not include `iss`. The field must be undefined,
+    // so the SDK treats it as absent rather than as an empty-string issuer.
+    const result = await setupOAuthCallbackServerWithLongPoll({
+      port: 0,
+      path: '/oauth/callback',
+      events: rfc9207Events,
+      serverUrlHash: 'test-hash',
+    })
+    rfc9207Server = result.server
+
+    const base = `http://127.0.0.1:${result.actualPort}/oauth/callback`
+    await fetch(`${base}?code=legacy-code&state=legacy-state`)
+
+    const received = await result.waitForAuthCode()
+
+    expect(received.code).toBe('legacy-code')
+    expect(received.state).toBe('legacy-state')
+    expect(received.iss).toBeUndefined()
+  })
+})
+
 /**
  * The 2026-07-28 revision retired the `initialize` handshake, so a desktop host that still sends one
  * cannot reach a server that has moved on - the spec's compatibility matrix puts that pair in the one
