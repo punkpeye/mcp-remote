@@ -1,11 +1,19 @@
 import { z } from 'zod'
 import { OAuthClientInformationFullSchema, OAuthTokensSchema } from '@modelcontextprotocol/core'
-import { OAuthError, OAuthErrorCode, refreshAuthorization, selectClientAuthMethod, selectResourceURL } from '@modelcontextprotocol/client'
+import {
+  auth,
+  OAuthError,
+  OAuthErrorCode,
+  refreshAuthorization,
+  selectClientAuthMethod,
+  selectResourceURL,
+} from '@modelcontextprotocol/client'
 import type {
   OAuthClientInformation,
   OAuthClientInformationFull,
   OAuthClientInformationMixed,
   OAuthClientProvider,
+  OAuthDiscoveryState,
   OAuthTokens,
 } from '@modelcontextprotocol/client'
 import { type OAuthProviderOptions, type StaticOAuthClientInformationFull, type StaticOAuthClientMetadata } from './types'
@@ -229,6 +237,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private recentAuthorizations: number[] = []
   /** In-flight proactive refresh, so concurrent requests share one refresh_token use */
   private refreshInFlight: Promise<OAuthTokensWithExpiresAt | undefined> | null = null
+  /** Concurrent requests share one client_credentials renewal, which has no refresh token. */
+  private clientCredentialsInFlight: Promise<void> | null = null
   /**
    * The sign-in being started, so concurrent arms join it rather than race it.
    *
@@ -277,6 +287,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     } else if (this.authorizeResource) {
       const resourceUrl = new URL(this.authorizeResource)
       this.validateResourceURL = async () => resourceUrl
+    } else if (this.hasExplicitTokenEndpoint) {
+      // The SDK needs resource metadata to skip discovery, but our configured state is not a
+      // server advertisement of RFC 8707 support. Preserve the no-metadata resource default.
+      this.validateResourceURL = async () => undefined
     }
     // Otherwise left undefined so the SDK applies its default resource selection.
   }
@@ -285,8 +299,49 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.options.callbackPort = port
   }
 
-  get redirectUrl(): string {
+  private get hasExplicitTokenEndpoint(): boolean {
+    return this.useClientCredentials && !!this.options.tokenEndpoint
+  }
+
+  get redirectUrl(): string | undefined {
+    // This selects the SDK's non-interactive token exchange, before it builds a PKCE redirect.
+    if (this.hasExplicitTokenEndpoint) return undefined
     return buildRedirectUrl(this.options.host, this.options.callbackPort, this.callbackPath)
+  }
+
+  discoveryState(): OAuthDiscoveryState | undefined {
+    if (!this.hasExplicitTokenEndpoint) return undefined
+    const endpoint = new URL(this.options.tokenEndpoint!)
+    return {
+      authorizationServerUrl: endpoint.origin,
+      authorizationServerMetadata: {
+        issuer: endpoint.origin,
+        token_endpoint: endpoint.href,
+        grant_types_supported: ['client_credentials'],
+        // The SDK types full OAuth/OIDC documents, but this grant has no authorization endpoint.
+      } as unknown as OAuthDiscoveryState['authorizationServerMetadata'],
+      // Both layers must be present: the SDK otherwise still probes protected-resource metadata
+      // after a 401, even when the authorization server and token endpoint are already known.
+      resourceMetadata: { resource: this.resourceServerUrl, authorization_servers: [endpoint.origin] },
+    }
+  }
+
+  async prepareTokenRequest(scope?: string): Promise<URLSearchParams | undefined> {
+    if (!this.hasExplicitTokenEndpoint) return undefined
+    if (this.inTokenStorm()) throw this.tokenStormError()
+    const clientInformation = await this.clientInformation()
+    if (!clientInformation?.client_secret) {
+      throw new Error('The client_credentials grant needs a client secret; supply it with --static-oauth-client-info')
+    }
+    const params = new URLSearchParams({ grant_type: 'client_credentials' })
+    // Keep an operator-pinned scope authoritative even when a 401 challenges for another scope.
+    const effectiveScope = this.staticOAuthClientMetadata?.scope?.trim() || scope
+    if (effectiveScope) params.set('scope', effectiveScope)
+    // saveTokens records this request so a renewal, including after restart, can repeat a scope
+    // learned from the challenge even when the token response omits its optional scope field.
+    this.wwwAuthenticateScope = effectiveScope
+    log(`Requesting a token from ${new URL(this.options.tokenEndpoint!).origin} with the client_credentials grant`)
+    return params
   }
 
   /**
@@ -301,7 +356,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   get clientMetadata() {
     const effectiveScope = this.getEffectiveScope()
     return {
-      redirect_uris: [this.redirectUrl],
+      redirect_uris: this.redirectUrl ? [this.redirectUrl] : [],
       token_endpoint_auth_method: this.getTokenEndpointAuthMethod(),
       grant_types: this.grantTypes(),
       response_types: ['code'],
@@ -409,7 +464,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   }
 
   private getEffectiveScope(): string {
-    return this.requestedScope() ?? FALLBACK_SCOPE
+    return this.requestedScope() ?? (this.hasExplicitTokenEndpoint ? '' : FALLBACK_SCOPE)
   }
 
   private requestedScope(): string | undefined {
@@ -484,7 +539,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   addClientAuthentication: NonNullable<OAuthClientProvider['addClientAuthentication']> = async (headers, params, _url, metadata) => {
     const clientInformation = await this.clientInformation()
     if (clientInformation) {
-      const authMethod = selectClientAuthMethod(clientInformation, metadata?.token_endpoint_auth_methods_supported ?? [])
+      const authMethod = selectClientAuthMethod(
+        this.hasExplicitTokenEndpoint && this.staticOAuthClientMetadata?.token_endpoint_auth_method
+          ? { ...clientInformation, token_endpoint_auth_method: this.staticOAuthClientMetadata.token_endpoint_auth_method }
+          : clientInformation,
+        metadata?.token_endpoint_auth_methods_supported ?? [],
+      )
       applyClientAuthentication(authMethod, clientInformation, headers, params)
     }
     if (params.get('grant_type') === 'refresh_token' && !params.has('scope')) {
@@ -657,6 +717,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       // Waiting for a 401 assumes the server answers expiry with exactly 401 -
       // one that replies 400 or 403 instead never reaches the SDK's refresh path
       // and the connection just fails (see issue #273).
+      if (isExpired && this.hasExplicitTokenEndpoint) {
+        await this.renewClientCredentials(tokens.requested_scope ?? tokens.scope)
+        // Read the newly persisted token directly: a short-lived token may already fall inside
+        // the expiry margin, and recursively calling tokens() would immediately renew it again.
+        return this.asBearerTokens(
+          await readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema),
+        )
+      }
       if (isExpired && tokens.refresh_token) {
         const refreshed = await this.refreshTokens(tokens.refresh_token)
         if (refreshed) {
@@ -671,6 +739,19 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     }
 
     return this.asBearerTokens(tokens)
+  }
+
+  private async renewClientCredentials(scope?: string): Promise<void> {
+    if (!this.clientCredentialsInFlight) {
+      // The SDK's non-interactive path does not call tokens(), so this cannot recurse. Use the
+      // same configured endpoint, scope, resource and client authentication as its 401 retry.
+      this.clientCredentialsInFlight = auth(this, { serverUrl: this.resourceServerUrl, scope })
+        .then(() => {})
+        .finally(() => {
+          this.clientCredentialsInFlight = null
+        })
+    }
+    await this.clientCredentialsInFlight
   }
 
   /**

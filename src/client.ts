@@ -90,6 +90,7 @@ async function runClient(
     useIdToken,
     useDeviceCode,
     useClientCredentials,
+    tokenEndpoint,
     authorizeResource,
     skipResourceParameter,
     authorizeParams,
