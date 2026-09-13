@@ -101,6 +101,7 @@ async function runProxy(
     useIdToken,
     useDeviceCode,
     useClientCredentials,
+    tokenEndpoint,
     authorizeResource,
     skipResourceParameter,
     authorizeParams,
