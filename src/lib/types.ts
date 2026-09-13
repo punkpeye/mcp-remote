@@ -39,6 +39,8 @@ export interface OAuthProviderOptions {
   useDeviceCode?: boolean
   /** Sign in as the software itself with the RFC 6749 `client_credentials` grant */
   useClientCredentials?: boolean
+  /** Explicit client_credentials token endpoint; bypasses OAuth discovery throughout authentication. */
+  tokenEndpoint?: string
   /** Resource parameter to send to the authorization server */
   authorizeResource?: string
   /** Omit the RFC 8707 resource parameter entirely (some servers reject it, e.g. Entra ID v2) */
