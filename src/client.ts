@@ -10,7 +10,7 @@
  */
 
 import { EventEmitter } from 'events'
-import { Client } from '@modelcontextprotocol/client'
+import { Client, createFetchWithInit } from '@modelcontextprotocol/client'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import {
   parseCommandLineArgs,
@@ -19,6 +19,7 @@ import {
   debugLog,
   MCP_REMOTE_VERSION,
   connectToRemoteServer,
+  fetchWithMcpHeaders,
   TransportStrategy,
   discoverOAuthServerInfo,
 } from './lib/utils'
@@ -91,6 +92,7 @@ async function runClient(
     useDeviceCode,
     useClientCredentials,
     tokenEndpoint,
+    fetchFn: createFetchWithInit(fetchWithMcpHeaders, { headers }),
     authorizeResource,
     skipResourceParameter,
     authorizeParams,

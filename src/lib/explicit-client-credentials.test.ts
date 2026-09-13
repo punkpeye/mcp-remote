@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
+import { Client, StreamableHTTPClientTransport, createFetchWithInit } from '@modelcontextprotocol/client'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import { getConfigFilePath, writeJsonFile } from './mcp-auth-config'
 import type { OAuthProviderOptions } from './types'
@@ -32,12 +32,14 @@ class TestNetwork {
   challengeScope?: string
   rejectAllTokens = false
   tokenFailure = false
+  tokenUnavailable = false
 
   fetch: typeof fetch = async (input, init) => {
     const request = new Request(input, init)
     if (request.url === tokenEndpoint) {
       this.tokenRequests.push({ headers: request.headers, params: new URLSearchParams(await request.text()) })
       if (this.tokenFailure) return json(400, { error: 'invalid_client', error_description: 'Client credentials rejected' })
+      if (this.tokenUnavailable) return json(503, { error: 'temporarily_unavailable', error_description: 'Token endpoint unavailable' })
       const accessToken = `issued-${this.tokenRequests.length}`
       this.acceptedToken = accessToken
       return json(200, { access_token: accessToken, token_type: 'Bearer', expires_in: 3600 })
@@ -104,11 +106,16 @@ describe('Explicit client credentials with an MCP server behind enterprise disco
     })
   }
 
-  async function connect(authProvider: NodeOAuthClientProvider) {
+  async function connect(authProvider: NodeOAuthClientProvider, requestInit?: RequestInit) {
     const client = new Client({ name: 'explicit-auth-regression', version: '1' }, { capabilities: {} })
     clients.push(client)
-    await client.connect(new StreamableHTTPClientTransport(new URL(serverUrl), { authProvider }), { timeout: 2000 })
+    await client.connect(new StreamableHTTPClientTransport(new URL(serverUrl), { authProvider, requestInit }), { timeout: 2000 })
     return client
+  }
+
+  async function expireCachedToken(expiresAt: number) {
+    const cached = JSON.parse(await readFile(getConfigFilePath(serverUrlHash, 'tokens.json'), 'utf8'))
+    await writeJsonFile(serverUrlHash, 'tokens.json', { ...cached, expires_at: expiresAt })
   }
 
   it('initializes and lists tools from a cold cache without any discovery or browser authorization', async () => {
@@ -165,8 +172,7 @@ describe('Explicit client credentials with an MCP server behind enterprise disco
 
   it('renews an expired token before tools/list on an already initialized transport', async () => {
     const client = await connect(provider())
-    const cached = JSON.parse(await readFile(getConfigFilePath(serverUrlHash, 'tokens.json'), 'utf8'))
-    await writeJsonFile(serverUrlHash, 'tokens.json', { ...cached, expires_at: Date.now() - 1000 })
+    await expireCachedToken(Date.now() - 1000)
 
     expect((await client.listTools()).tools).toEqual([tool])
 
@@ -175,6 +181,43 @@ describe('Explicit client credentials with an MCP server behind enterprise disco
       { method: 'tools/list', bearer: 'Bearer issued-2' },
     ])
     expect(network.discoveryRequests).toEqual([])
+  })
+
+  it('keeps sending a still-accepted token when renewal inside the expiry margin fails', async () => {
+    const client = await connect(provider())
+    await expireCachedToken(Date.now() + 30_000)
+    network.tokenUnavailable = true
+
+    expect((await client.listTools()).tools).toEqual([tool])
+
+    expect(network.tokenRequests).toHaveLength(2)
+    expect(network.mcpRequests.filter((request) => request.method === 'tools/list')).toEqual([
+      { method: 'tools/list', bearer: 'Bearer issued-1' },
+    ])
+    expect(network.discoveryRequests).toEqual([])
+  })
+
+  it('reports the token endpoint failure once the stored token is refused', async () => {
+    const client = await connect(provider())
+    await expireCachedToken(Date.now() - 1000)
+    network.acceptedToken = 'revoked'
+    network.tokenUnavailable = true
+
+    await expect(client.listTools()).rejects.toThrow(/Token endpoint unavailable/)
+
+    // The first token, the renewal that failed, and the single retry after the 401
+    expect(network.tokenRequests).toHaveLength(3)
+    expect(network.discoveryRequests).toEqual([])
+  })
+
+  it('renews through the same fetch as a 401 retry, so both carry the transport headers', async () => {
+    const requestInit = { headers: { 'X-Tenant': 'acme' } }
+    const client = await connect(provider({ fetchFn: createFetchWithInit(network.fetch, requestInit) }), requestInit)
+    await expireCachedToken(Date.now() - 1000)
+
+    expect((await client.listTools()).tools).toEqual([tool])
+
+    expect(network.tokenRequests.map((request) => request.headers.get('x-tenant'))).toEqual(['acme', 'acme'])
   })
 
   it('renews an expired cached token without a refresh token before sending it, sharing concurrent renewal', async () => {

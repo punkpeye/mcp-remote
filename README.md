@@ -510,9 +510,10 @@ npx mcp-remote https://example.remote/mcp \
 
 The explicit endpoint must use HTTPS, except for an HTTP loopback endpoint. Credentials and URL
 fragments are refused in the endpoint URL, and changing the endpoint selects a separate token cache.
-Discovery is also skipped on cold startup and 401 retries. Tokens are renewed before expiry using
-the same client credentials. With an explicit endpoint, scope and resource are omitted unless
-configured; use `--static-oauth-client-metadata` for scope and `--resource` for resource.
+Discovery is also skipped on cold startup and 401 retries. Tokens are renewed before expiry using the
+same client credentials; if renewal fails, the current token is sent until the server refuses it. With
+an explicit endpoint, `scope` is omitted unless configured with `--static-oauth-client-metadata` or
+named in the server's 401 challenge, and `resource` is omitted unless set with `--resource`.
 
 ### Signing In Without a Browser
 

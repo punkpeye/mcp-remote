@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events'
-import type { OAuthClientInformationFull, OAuthClientMetadata } from '@modelcontextprotocol/client'
+import type { FetchLike, OAuthClientInformationFull, OAuthClientMetadata } from '@modelcontextprotocol/client'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 
@@ -41,6 +41,11 @@ export interface OAuthProviderOptions {
   useClientCredentials?: boolean
   /** Explicit client_credentials token endpoint; bypasses OAuth discovery throughout authentication. */
   tokenEndpoint?: string
+  /**
+   * The fetch the transports hand the SDK for authorization requests, `--header` values included.
+   * A token renewal the provider starts itself goes through it too, so it matches a 401 retry.
+   */
+  fetchFn?: FetchLike
   /** Resource parameter to send to the authorization server */
   authorizeResource?: string
   /** Omit the RFC 8707 resource parameter entirely (some servers reject it, e.g. Entra ID v2) */

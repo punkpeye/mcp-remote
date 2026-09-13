@@ -10,12 +10,14 @@
  */
 
 import { EventEmitter } from 'events'
+import { createFetchWithInit } from '@modelcontextprotocol/client'
 import type { Transport } from '@modelcontextprotocol/client'
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio'
 import {
   connectToRemoteServer,
   log,
   debugLog,
+  fetchWithMcpHeaders,
   mcpProxy,
   parseCommandLineArgs,
   setupSignalHandlers,
@@ -102,6 +104,7 @@ async function runProxy(
     useDeviceCode,
     useClientCredentials,
     tokenEndpoint,
+    fetchFn: createFetchWithInit(fetchWithMcpHeaders, { headers }),
     authorizeResource,
     skipResourceParameter,
     authorizeParams,
