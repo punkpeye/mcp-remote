@@ -718,12 +718,21 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       // one that replies 400 or 403 instead never reaches the SDK's refresh path
       // and the connection just fails (see issue #273).
       if (isExpired && this.hasExplicitTokenEndpoint) {
-        await this.renewClientCredentials(tokens.requested_scope ?? tokens.scope)
-        // Read the newly persisted token directly: a short-lived token may already fall inside
-        // the expiry margin, and recursively calling tokens() would immediately renew it again.
-        return this.asBearerTokens(
-          await readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema),
-        )
+        try {
+          await this.renewClientCredentials(tokens.requested_scope ?? tokens.scope)
+          // Read the newly persisted token directly: a short-lived token may already fall inside
+          // the expiry margin, and recursively calling tokens() would immediately renew it again.
+          return this.asBearerTokens(
+            await readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema),
+          )
+        } catch (error) {
+          // Renewal starts a minute before expiry, while the stored token is still accepted, so an
+          // unreachable token endpoint must not fail a request that token could still carry. One that
+          // has really expired is refused, and the SDK's 401 handling asks for a token again.
+          debugLog('Proactive client_credentials renewal failed', error)
+          log('Proactive token renewal failed, falling back to the stored token')
+          return this.asBearerTokens(tokens)
+        }
       }
       if (isExpired && tokens.refresh_token) {
         const refreshed = await this.refreshTokens(tokens.refresh_token)
@@ -743,9 +752,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
   private async renewClientCredentials(scope?: string): Promise<void> {
     if (!this.clientCredentialsInFlight) {
-      // The SDK's non-interactive path does not call tokens(), so this cannot recurse. Use the
-      // same configured endpoint, scope, resource and client authentication as its 401 retry.
-      this.clientCredentialsInFlight = auth(this, { serverUrl: this.resourceServerUrl, scope })
+      // The SDK's non-interactive path does not call tokens(), so this cannot recurse. Use the same
+      // configured endpoint, scope, resource, client authentication and fetch as its 401 retry.
+      this.clientCredentialsInFlight = auth(this, { serverUrl: this.resourceServerUrl, scope, fetchFn: this.options.fetchFn })
         .then(() => {})
         .finally(() => {
           this.clientCredentialsInFlight = null
