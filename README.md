@@ -497,6 +497,20 @@ way as for every other flow, and `client_secret_basic` or `client_secret_post` i
 authorization server advertises. No refresh token is involved: the credentials are the durable thing, so
 an expired token is replaced by asking for another the same way the first was obtained.
 
+If an internal server does not publish RFC 9728 or RFC 8414/OIDC discovery metadata, provide its known
+token endpoint explicitly. This skips discovery and is accepted only with `--client-credentials`:
+
+```bash
+npx mcp-remote https://example.remote/mcp \
+  --client-credentials \
+  --token-endpoint https://auth.example.com/oauth/token \
+  --static-oauth-client-info '{"client_id":"my-client","client_secret":"${MCP_CLIENT_SECRET}"}' \
+  --static-oauth-client-metadata '{"scope":"mcp.read mcp.write","token_endpoint_auth_method":"client_secret_basic"}'
+```
+
+The explicit endpoint must use HTTPS, except for an HTTP loopback endpoint. Credentials and URL
+fragments are refused in the endpoint URL, and changing the endpoint selects a separate token cache.
+
 ### Signing In Without a Browser
 
 The default flow needs a browser on this machine and a loopback port to redirect back to — which a

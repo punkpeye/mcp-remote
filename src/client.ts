@@ -43,6 +43,7 @@ async function runClient(
   useIdToken: boolean,
   useDeviceCode: boolean,
   useClientCredentials: boolean,
+  tokenEndpoint: string | undefined,
   authorizeResource: string | undefined,
   skipResourceParameter: boolean,
   authorizeParams: Record<string, string>,
@@ -62,7 +63,7 @@ async function runClient(
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
   log('Discovering OAuth server configuration...')
-  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)
+  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers, tokenEndpoint)
 
   if (discoveryResult.protectedResourceMetadata) {
     log(`Discovered authorization server: ${discoveryResult.authorizationServerUrl}`)
@@ -216,6 +217,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
       useIdToken,
       useDeviceCode,
       useClientCredentials,
+      tokenEndpoint,
       authorizeResource,
       skipResourceParameter,
       authorizeParams,
@@ -236,6 +238,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
         useIdToken,
         useDeviceCode,
         useClientCredentials,
+        tokenEndpoint,
         authorizeResource,
         skipResourceParameter,
         authorizeParams,
