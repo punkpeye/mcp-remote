@@ -1576,6 +1576,36 @@ describe('Feature: MCP Proxy', () => {
     )
   })
 
+  it('Scenario: Bound remote messages while the local transport is backpressured', async () => {
+    // Given a local transport whose first write never drains
+    const pendingSend = new Promise<void>(() => {})
+    const mockTransportToClient = {
+      send: vi.fn().mockReturnValue(pendingSend),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    } as unknown as Transport
+    const mockTransportToServer = mockTransport()
+
+    mcpProxy({ transportToClient: mockTransportToClient, transportToServer: mockTransportToServer, ignoredTools: [] })
+
+    // When a remote endpoint floods notifications faster than stdout can consume them
+    const payload = 'x'.repeat(64 * 1024)
+    for (let sequence = 0; sequence < 128; sequence++) {
+      mockTransportToServer.onmessage?.({
+        jsonrpc: '2.0',
+        method: 'notifications/progress',
+        params: { sequence, payload },
+      } as any)
+    }
+
+    // Then only one write is in flight and the remote side is closed once the bounded queue fills
+    await vi.waitFor(() => expect(mockTransportToServer.close).toHaveBeenCalledTimes(1))
+    expect(mockTransportToClient.send).toHaveBeenCalledTimes(1)
+  })
+
   it('Scenario: Close server transport when client transport closes', async () => {
     // Given mock transports for client and server
     const mockTransportToClient = {
@@ -1805,11 +1835,13 @@ describe('Feature: MCP Proxy', () => {
       result: { tools: [{ name: 'deleteTask' }, { name: 'listTasks' }] },
     } as any)
 
-    expect(mockTransportToClient.send).toHaveBeenCalledWith(
-      expect.objectContaining({
-        id: 1,
-        result: { tools: [{ name: 'listTasks' }] },
-      }),
+    await vi.waitFor(() =>
+      expect(mockTransportToClient.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 1,
+          result: { tools: [{ name: 'listTasks' }] },
+        }),
+      ),
     )
   })
 

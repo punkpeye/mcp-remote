@@ -418,6 +418,12 @@ const SUBSCRIPTION_REOPEN_LIMIT = 5
  */
 const SUBSCRIPTION_HELD_OPEN_MS = 30_000
 
+/** Maximum remote messages retained while the local stdio transport is backpressured. */
+const REMOTE_TO_CLIENT_MAX_MESSAGES = 64
+
+/** Maximum encoded remote payload retained while the local stdio transport is backpressured. */
+const REMOTE_TO_CLIENT_MAX_BYTES = 4 * 1024 * 1024
+
 /** A timer that never keeps the process alive on its own. */
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -630,6 +636,11 @@ export function mcpProxy({
    * reconnect is not counted as one the vanished session owes an answer for.
    */
   const pendingRequests = new Set<string | number>()
+  const remoteToClientQueue: { message: Message; bytes: number }[] = []
+  let remoteToClientQueuedMessages = 0
+  let remoteToClientQueuedBytes = 0
+  let remoteToClientWriting = false
+  let remoteToClientOverflowed = false
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -887,7 +898,7 @@ export function mcpProxy({
       applyNegotiatedProtocolVersion(message)
     }
 
-    transportToClient.send(message).catch(onClientError)
+    forwardRemoteMessage(message)
   }
 
   transportToClient.onclose = () => {
@@ -953,6 +964,61 @@ export function mcpProxy({
   function onClientError(error: Error) {
     log('Error from local client:', error)
     debugLog('Error from local client', { stack: error.stack })
+  }
+
+  /**
+   * Serializes remote messages behind the local transport's backpressure promise.
+   *
+   * A transport callback cannot pause remote ingestion itself, so the queue is bounded by both
+   * message count and encoded bytes. Once either bound would be crossed, the remote connection is
+   * closed instead of retaining an attacker-controlled amount of data in memory.
+   */
+  function forwardRemoteMessage(message: Message) {
+    if (remoteToClientOverflowed || transportToClientClosed || transportToServerClosed) return
+
+    const encoded = JSON.stringify(message)
+    const bytes = Buffer.byteLength(encoded === undefined ? 'null' : encoded, 'utf8') + 1
+    if (
+      remoteToClientQueuedMessages + 1 > REMOTE_TO_CLIENT_MAX_MESSAGES ||
+      remoteToClientQueuedBytes + bytes > REMOTE_TO_CLIENT_MAX_BYTES
+    ) {
+      remoteToClientOverflowed = true
+      remoteToClientQueue.length = 0
+      log(
+        `Closing the remote connection: local client backpressure exceeded ${REMOTE_TO_CLIENT_MAX_MESSAGES} messages or ${REMOTE_TO_CLIENT_MAX_BYTES} bytes`,
+      )
+      transportToServer.close().catch(onServerError)
+      return
+    }
+
+    remoteToClientQueue.push({ message, bytes })
+    remoteToClientQueuedMessages++
+    remoteToClientQueuedBytes += bytes
+    void drainRemoteMessages()
+  }
+
+  async function drainRemoteMessages() {
+    if (remoteToClientWriting) return
+    remoteToClientWriting = true
+
+    try {
+      while (!remoteToClientOverflowed && remoteToClientQueue.length > 0) {
+        const queued = remoteToClientQueue.shift()!
+        try {
+          await transportToClient.send(queued.message)
+        } catch (error) {
+          onClientError(error as Error)
+          remoteToClientOverflowed = true
+          remoteToClientQueue.length = 0
+          transportToServer.close().catch(onServerError)
+        } finally {
+          remoteToClientQueuedMessages--
+          remoteToClientQueuedBytes -= queued.bytes
+        }
+      }
+    } finally {
+      remoteToClientWriting = false
+    }
   }
 
   function applyNegotiatedProtocolVersion(response: Message) {
