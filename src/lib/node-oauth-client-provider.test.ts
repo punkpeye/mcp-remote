@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { createHash } from 'node:crypto'
-import { NodeOAuthClientProvider } from './node-oauth-client-provider'
+import { NodeOAuthClientProvider, OAuthTokensWithExpiresAtSchema } from './node-oauth-client-provider'
 import * as mcpAuthConfig from './mcp-auth-config'
 import type { OAuthProviderOptions } from './types'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
@@ -1674,5 +1674,67 @@ describe('NodeOAuthClientProvider - a sign-in loop that never reaches a token', 
 
     // Then the next one stops rather than opening another tab
     await expect(authorize()).rejects.toThrow('none of which completed')
+  })
+})
+
+describe('Feature: Re-saving a stored token keeps its expiry', () => {
+  const options: OAuthProviderOptions = {
+    serverUrl: 'https://example.com',
+    callbackPort: 8080,
+    host: 'localhost',
+    serverUrlHash: 'test-hash',
+  }
+  let writeJsonFile: any
+
+  beforeEach(() => {
+    writeJsonFile = vi.mocked(mcpAuthConfig.writeJsonFile)
+    vi.mocked(mcpAuthConfig.readJsonFile).mockResolvedValue(undefined)
+    writeJsonFile.mockResolvedValue(undefined)
+    vi.mocked(mcpAuthConfig.deleteConfigFile).mockResolvedValue(undefined)
+  })
+
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const savedTokens = () => writeJsonFile.mock.calls.find((call: any[]) => call[1] === 'tokens.json')[2]
+
+  it('Scenario: A freshly issued token gets an absolute expiry computed from expires_in', async () => {
+    const provider = new NodeOAuthClientProvider(options)
+    const before = Date.now()
+
+    await provider.saveTokens({ access_token: 'at', token_type: 'Bearer', expires_in: 3600 })
+
+    expect(savedTokens().expires_at).toBeGreaterThanOrEqual(before + 3600 * 1000)
+    expect(savedTokens().expires_at).toBeLessThanOrEqual(Date.now() + 3600 * 1000)
+  })
+
+  it('Scenario: A token read back from disk keeps the expiry it was stored with', async () => {
+    // Given a token that lapsed an hour ago, saved again the way the SDK does when it stamps the issuer
+    const provider = new NodeOAuthClientProvider(options)
+    const lapsed = Date.now() - 3600 * 1000
+
+    await provider.saveTokens({
+      access_token: 'at',
+      token_type: 'Bearer',
+      expires_in: 604800,
+      expires_at: lapsed,
+      issuer: 'https://as.example',
+    } as any)
+
+    // Then it is still lapsed - not good for another week - and the issuer stamp is kept
+    expect(savedTokens().expires_at).toBe(lapsed)
+    expect(savedTokens().issuer).toBe('https://as.example')
+  })
+
+  it('Scenario: The issuer survives a round trip through the stored-token schema', () => {
+    const parsed = OAuthTokensWithExpiresAtSchema.parse({
+      access_token: 'at',
+      token_type: 'Bearer',
+      expires_in: 3600,
+      issuer: 'https://as.example',
+    })
+
+    expect(parsed.issuer).toBe('https://as.example')
   })
 })
