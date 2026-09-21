@@ -54,6 +54,12 @@ type OAuthTokensWithExpiresAt = OAuthTokens & {
   expires_at?: number
   /** The scope this client asked for when the token was obtained. See {@link scopeRequestChanged}. */
   requested_scope?: string
+  /**
+   * The authorization server the tokens came from. The SDK stamps it onto a stored token that
+   * lacks it and saves the result, so it has to survive the round trip through this schema -
+   * otherwise every sign-in begins by re-saving the same token.
+   */
+  issuer?: string
 }
 
 /**
@@ -71,6 +77,7 @@ type TokenStoreSchema = {
 export const OAuthTokensWithExpiresAtSchema: TokenStoreSchema = OAuthTokensSchema.extend({
   expires_at: z.coerce.number().optional(),
   requested_scope: z.string().optional(),
+  issuer: z.string().optional(),
 })
 
 const FALLBACK_SCOPE = 'openid email profile'
@@ -1058,7 +1065,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.recentAuthorizations.push(now)
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
+  /**
+   * Takes the stored shape rather than the SDK's `OAuthTokens`, because the SDK hands back
+   * whatever {@link tokens} returned when it re-saves - `expires_at` and all. Naming that here
+   * is what lets the expiry below be read instead of cast for.
+   */
+  async saveTokens(tokens: OAuthTokensWithExpiresAt): Promise<void> {
     this.guardAgainstTokenStorm()
 
     const timeLeft = tokens.expires_in || 0
@@ -1082,9 +1094,15 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // Persist an absolute expiry timestamp alongside the token so that future
     // reads can detect imminent expiry and refresh proactively (the spec only
     // provides the relative `expires_in`, which is meaningless once stored).
+    //
+    // A token that already carries `expires_at` was read back from disk - the SDK re-saves a
+    // stored token to stamp the issuer on it - and its clock must not restart. Recomputing from
+    // `expires_in` here declared a lapsed token good for another full lifetime, so on a 401 a
+    // second instance judged it usable, skipped the shared sign-in and retried the dead
+    // credential: one failed request and an extra browser tab per instance.
     const tokensToSave: OAuthTokensWithExpiresAt = {
       ...tokens,
-      expires_at: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined,
+      expires_at: tokens.expires_at ?? (tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined),
       requested_scope: this.getEffectiveScope(),
     }
 
