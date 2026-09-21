@@ -1720,7 +1720,7 @@ describe('Feature: Re-saving a stored token keeps its expiry', () => {
       expires_in: 604800,
       expires_at: lapsed,
       issuer: 'https://as.example',
-    } as any)
+    })
 
     // Then it is still lapsed - not good for another week - and the issuer stamp is kept
     expect(savedTokens().expires_at).toBe(lapsed)

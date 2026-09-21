@@ -1065,7 +1065,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.recentAuthorizations.push(now)
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
+  /**
+   * Takes the stored shape rather than the SDK's `OAuthTokens`, because the SDK hands back
+   * whatever {@link tokens} returned when it re-saves - `expires_at` and all. Naming that here
+   * is what lets the expiry below be read instead of cast for.
+   */
+  async saveTokens(tokens: OAuthTokensWithExpiresAt): Promise<void> {
     this.guardAgainstTokenStorm()
 
     const timeLeft = tokens.expires_in || 0
@@ -1095,10 +1100,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // `expires_in` here declared a lapsed token good for another full lifetime, so on a 401 a
     // second instance judged it usable, skipped the shared sign-in and retried the dead
     // credential: one failed request and an extra browser tab per instance.
-    const stored = tokens as Partial<OAuthTokensWithExpiresAt>
     const tokensToSave: OAuthTokensWithExpiresAt = {
       ...tokens,
-      expires_at: stored.expires_at ?? (tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined),
+      expires_at: tokens.expires_at ?? (tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined),
       requested_scope: this.getEffectiveScope(),
     }
 
