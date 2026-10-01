@@ -40,6 +40,8 @@ export type RunOptions = {
   configDir?: string
   /** Holds the port these instances would derive, standing in for an unrelated process. */
   squatDerivedPort?: boolean
+  /** Records login tabs without completing them, as when the workstation is unattended. */
+  ignoreAuthorization?: boolean
 }
 
 /**
@@ -70,7 +72,9 @@ export async function runInstances(options: RunOptions): Promise<InstanceRun> {
         ...process.env,
         MCP_REMOTE_CONFIG_DIR: configDir,
         MCP_TEST_TAB_LOG: tabLog,
-        ...(options.approveFirstTabAfterKillMs === undefined ? {} : { MCP_TEST_TABS_APPROVED_EXTERNALLY: '1' }),
+        ...(options.approveFirstTabAfterKillMs === undefined && !options.ignoreAuthorization
+          ? {}
+          : { MCP_TEST_TABS_APPROVED_EXTERNALLY: '1' }),
         NODE_OPTIONS: `--import ${pathToImport(path.join(here, 'browser-hook.mjs'))}`,
       },
     })

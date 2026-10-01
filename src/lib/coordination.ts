@@ -7,7 +7,7 @@ import { Server } from 'http'
 import express from 'express'
 import { log, debugLog, setupOAuthCallbackServerWithLongPoll, MCP_REMOTE_ID_PATH } from './utils'
 
-/** How long to wait on another instance's sign-in before going it alone. Sign-ins involve a human. */
+/** How long to wait on another instance's sign-in before reporting it is still pending. */
 const FOLLOWER_PATIENCE_MS = 3 * 60_000
 
 /**
@@ -312,7 +312,7 @@ async function followUntilTokensOrPort(
   followerPatienceMs: number,
 ): Promise<{ server: Server; actualPort: number; waitForAuthCode: () => Promise<AuthCodeResult>; skipBrowserAuth: boolean }> {
   // The person at the browser may be going through SSO, MFA or a password manager, so this is
-  // deliberately longer than the handoff window - and running out is no longer fatal.
+  // deliberately longer than the handoff window.
   const deadline = Date.now() + Math.max(authTimeoutMs, followerPatienceMs)
 
   while (Date.now() < deadline) {
@@ -342,11 +342,13 @@ async function followUntilTokensOrPort(
     await new Promise((resolve) => setTimeout(resolve, FOLLOWER_POLL_INTERVAL_MS))
   }
 
-  // Whatever we were waiting for is not coming. Connecting unaided may still work - the server
-  // may not need OAuth at all, or may challenge us and let the 401 handler run - and it is always
-  // better than exiting, which is what a wrong guess used to cost.
-  log(`Gave up waiting for another instance on port ${port}; continuing without owning the sign-in`)
-  return unownedFlow(port)
+  // A timeout is not a completed login. Returning skipBrowserAuth here lets the caller start
+  // an authenticated transport without tokens; the SDK opens another tab before its 401 handler
+  // can check ownership. Only a usable token above permits a follower to reconnect.
+  throw new Error(
+    `Authentication is still pending in another instance on port ${port}. ` +
+      'Complete that sign-in and retry, or close the other instance to start a new sign-in.',
+  )
 }
 
 /**
