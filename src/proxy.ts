@@ -165,6 +165,11 @@ async function runProxy(
       protocolMode,
     )
 
+    // Connected, so any sign-in this instance owned is finished; let a later one bind the port.
+    // Not inside the connect: its post-auth reconnect still reads the coordination verdict.
+    await authCoordinator.release()
+    server = null
+
     // Set up bidirectional proxy between local and remote transports
     mcpProxy({
       transportToClient: localTransport,
@@ -217,6 +222,8 @@ async function runProxy(
         }
         await remoteTransport.finishAuth(code, iss)
         log('Re-authorized with the remote server')
+        await authCoordinator.release()
+        server = null
       },
     })
 
