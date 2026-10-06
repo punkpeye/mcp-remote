@@ -62,6 +62,7 @@ async function runProxy(
   serverUrlHash: string,
   keepAlive: KeepAliveConfig,
   protocolMode: ProtocolMode,
+  authSuccessUrl?: string,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -71,7 +72,15 @@ async function runProxy(
   const strictPort = !!specifiedPort || !!staticOAuthClientInfo || !!clientMetadataUrl
 
   // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPath, callbackPort, events, authTimeoutMs, strictPort)
+  const authCoordinator = createLazyAuthCoordinator(
+    serverUrlHash,
+    callbackPath,
+    callbackPort,
+    events,
+    authTimeoutMs,
+    strictPort,
+    authSuccessUrl,
+  )
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
@@ -207,15 +216,21 @@ async function runProxy(
           return
         }
 
-        const { code, state, iss } = await waitForAuthCode()
-        // The code may belong to a flow another instance started, whose verifier is not this one's
-        if (state) authProvider.useAuthorizationState(state)
+        const { code, state, iss, completeAuthorization } = await waitForAuthCode()
+        try {
+          // The code may belong to a flow another instance started, whose verifier is not this one's
+          if (state) authProvider.useAuthorizationState(state)
 
-        // Both transports this proxy can be given have it; the interface they share does not
-        if (!canFinishAuth(remoteTransport)) {
-          throw new Error(`${remoteTransport.constructor.name} cannot complete an authorization`)
+          // Both transports this proxy can be given have it; the interface they share does not
+          if (!canFinishAuth(remoteTransport)) {
+            throw new Error(`${remoteTransport.constructor.name} cannot complete an authorization`)
+          }
+          await remoteTransport.finishAuth(code, iss)
+          completeAuthorization?.(true)
+        } catch (error) {
+          completeAuthorization?.(false)
+          throw error
         }
-        await remoteTransport.finishAuth(code, iss)
         log('Re-authorized with the remote server')
       },
     })
@@ -294,6 +309,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
       serverUrlHash,
       keepAlive,
       protocolMode,
+      authSuccessUrl,
     }) => {
       return runProxy(
         serverUrl,
@@ -318,6 +334,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
         serverUrlHash,
         keepAlive,
         protocolMode,
+        authSuccessUrl,
       )
     },
   )

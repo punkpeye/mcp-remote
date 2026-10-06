@@ -74,6 +74,8 @@ export interface OAuthCallbackServerOptions {
   events: EventEmitter
   /** Timeout in milliseconds for the auth callback server's long poll */
   authTimeoutMs?: number
+  /** Optional browser destination after the authorization code has been exchanged successfully. */
+  authSuccessUrl?: string
   /** Identifies which server this callback server belongs to, for the identity probe */
   serverUrlHash: string
 }
@@ -89,6 +91,8 @@ export type AuthCodeResult = {
    * the SDK client rejects a missing `iss` as a mix-up-attack indicator.
    */
   iss?: string
+  /** Completes this code's browser response after the token exchange succeeds or fails. */
+  completeAuthorization?: (success: boolean) => void
 }
 
 /*

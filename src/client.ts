@@ -50,6 +50,7 @@ async function runClient(
   authorizeParams: Record<string, string>,
   authTimeoutMs: number,
   serverUrlHash: string,
+  authSuccessUrl?: string,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -59,7 +60,15 @@ async function runClient(
   const strictPort = !!specifiedPort || !!staticOAuthClientInfo || !!clientMetadataUrl
 
   // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPath, callbackPort, events, authTimeoutMs, strictPort)
+  const authCoordinator = createLazyAuthCoordinator(
+    serverUrlHash,
+    callbackPath,
+    callbackPort,
+    events,
+    authTimeoutMs,
+    strictPort,
+    authSuccessUrl,
+  )
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
@@ -226,6 +235,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
       authorizeParams,
       authTimeoutMs,
       serverUrlHash,
+      authSuccessUrl,
     }) => {
       return runClient(
         serverUrl,
@@ -247,6 +257,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
         authorizeParams,
         authTimeoutMs,
         serverUrlHash,
+        authSuccessUrl,
       )
     },
   )

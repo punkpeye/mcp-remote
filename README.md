@@ -223,6 +223,19 @@ Some authorization servers reject the resource parameter outright — Microsoft 
       ]
 ```
 
+* To send the browser to your own completion page after a successful OAuth token exchange, add `--auth-success-url`. The registered callback URL, state, PKCE flow and credential cache stay unchanged. No code, state, issuer or tokens are appended to the completion URL. Without this flag, the existing completion page is unchanged.
+
+```json
+      "args": [
+        "mcp-remote",
+        "https://remote.mcp.server/sse",
+        "--auth-success-url",
+        "https://app.example.com/cli-connected"
+      ]
+```
+
+  The destination must be HTTPS, or HTTP on loopback. For HTTP on a trusted private network, also pass `--allow-http`. URLs containing credentials, a query or a fragment are rejected. A failed or timed-out exchange shows an error on the callback page instead of redirecting. `--auth-timeout` also bounds this wait (30 seconds by default). The option applies to browser authentication in both binaries, including mid-session reauthorization; device-code and client-credentials authentication have no browser callback.
+
 * To allow HTTP connections in trusted private networks, add the `--allow-http` flag. Note: This should only be used in secure private networks where traffic cannot be intercepted.
 
 ```json

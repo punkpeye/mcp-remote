@@ -15,6 +15,7 @@ const mockState = vi.hoisted(() => ({
   rejectedTokenFailuresRemaining: 0,
   // Every authorization code handed to `finishAuth`, in order.
   finishAuthCalls: [] as string[],
+  finishAuthGate: null as (() => Promise<void>) | null,
 }))
 
 vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
@@ -40,6 +41,7 @@ vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
   class StreamableHTTPClientTransport {
     start = vi.fn().mockResolvedValue(undefined)
     finishAuth = vi.fn(async (code: string, _iss?: string) => {
+      await mockState.finishAuthGate?.()
       mockState.finishAuthCalls.push(code)
     })
     close = vi.fn().mockResolvedValue(undefined)
@@ -89,6 +91,7 @@ describe('connectToRemoteServer', () => {
   beforeEach(() => {
     mockState.httpTransports.length = 0
     mockState.finishAuthCalls.length = 0
+    mockState.finishAuthGate = null
     mockState.connectFailuresRemaining = 1
     mockState.rejectedTokenFailuresRemaining = 0
     // Keep test output quiet; connectToRemoteServer logs to stderr.
@@ -119,6 +122,81 @@ describe('connectToRemoteServer', () => {
 
     // Regression guard: it must NOT be called on the main transport (which never saw the 401).
     expect(mainTransport.finishAuth).not.toHaveBeenCalled()
+  })
+
+  it('completes the browser response only after finishAuth has resolved', async () => {
+    let finishExchange!: () => void
+    mockState.finishAuthGate = () =>
+      new Promise<void>((resolve) => {
+        finishExchange = resolve
+      })
+    const completeAuthorization = vi.fn()
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async () => ({ code: 'auth-code-success', completeAuthorization }),
+      skipBrowserAuth: false,
+    })
+    const connecting = connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')
+    await vi.waitFor(() => expect(finishExchange).toBeDefined())
+    expect(completeAuthorization).not.toHaveBeenCalled()
+    finishExchange()
+    await connecting
+    expect(mockState.finishAuthCalls).toEqual(['auth-code-success'])
+    expect(completeAuthorization).toHaveBeenCalledExactlyOnceWith(true)
+  })
+
+  it('fails the browser response if the token exchange rejects', async () => {
+    const error = new Error('issuer mismatch or invalid grant')
+    mockState.finishAuthGate = async () => {
+      throw error
+    }
+    const completeAuthorization = vi.fn()
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async () => ({ code: 'auth-code-failure', iss: 'https://wrong-issuer.example.com', completeAuthorization }),
+      skipBrowserAuth: false,
+    })
+    await expect(connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')).rejects.toThrow(
+      error,
+    )
+    expect(completeAuthorization).toHaveBeenCalledExactlyOnceWith(false)
+    expect(mockState.finishAuthCalls).toEqual([])
+  })
+
+  it('fails the browser response if state validation rejects before the exchange', async () => {
+    const completeAuthorization = vi.fn()
+    const authProvider = {
+      useAuthorizationState: () => {
+        throw new Error('invalid state')
+      },
+    } as any
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async () => ({ code: 'auth-code-state', state: 'invalid', completeAuthorization }),
+      skipBrowserAuth: false,
+    })
+    await expect(
+      connectToRemoteServer(null, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first'),
+    ).rejects.toThrow('invalid state')
+    expect(completeAuthorization).toHaveBeenCalledExactlyOnceWith(false)
+    expect(mockState.finishAuthCalls).toEqual([])
+  })
+
+  it('fails a browser response whose authorization retry budget has already been spent', async () => {
+    mockState.connectFailuresRemaining = Number.MAX_SAFE_INTEGER
+    const firstCompletion = vi.fn()
+    const secondCompletion = vi.fn()
+    let calls = 0
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async () => ({
+        code: `auth-code-${calls}`,
+        completeAuthorization: calls++ === 0 ? firstCompletion : secondCompletion,
+      }),
+      skipBrowserAuth: false,
+    })
+    await expect(connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first')).rejects.toThrow(
+      'Already attempted reconnection',
+    )
+    expect(firstCompletion).toHaveBeenCalledExactlyOnceWith(true)
+    expect(secondCompletion).toHaveBeenCalledExactlyOnceWith(false)
+    expect(mockState.finishAuthCalls).toHaveLength(1)
   })
 
   it('discards a token the server refused after issuing it, then signs in again', async () => {
