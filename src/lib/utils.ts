@@ -2357,25 +2357,23 @@ export async function connectToRemoteServer(
 
       // Wait for the authorization code from the callback
       debugLog('Waiting for auth code from callback server')
-      const { code, state, iss } = await waitForAuthCode()
+      const { code, state, iss, completeAuthorization } = await waitForAuthCode()
       debugLog('Received auth code from callback server')
 
       // The code may belong to a flow another instance started, whose verifier is not this one's
-      if (state && 'useAuthorizationState' in authProvider && typeof authProvider.useAuthorizationState === 'function') {
-        authProvider.useAuthorizationState(state)
-      }
-
-      // Checked before the exchange, not after: an authorization code is single-use (RFC 6749
-      // 4.1.2) and the callback server hands back the same retained code on a second call, so
-      // exchanging it again fails with invalid_grant and masks this message.
-      giveUpIfAlreadyRetried()
-
       try {
+        if (state && 'useAuthorizationState' in authProvider && typeof authProvider.useAuthorizationState === 'function') {
+          authProvider.useAuthorizationState(state)
+        }
+
+        // An authorization code is single-use; reject a spent retry budget before exchanging it.
+        giveUpIfAlreadyRetried()
         log('Completing authorization...')
         // Complete auth on the transport that received the 401 challenge (in proxy mode this is the
         // one-off test transport, not `transport`), so the stored resource_metadata URL is used to
         // discover the correct token_endpoint. Falls back to `transport` for the with-client path.
         await (authChallengeTransport ?? transport).finishAuth(code, iss)
+        completeAuthorization?.(true)
         debugLog('Authorization completed successfully')
 
         // Track this reason for recursion
@@ -2395,6 +2393,7 @@ export async function connectToRemoteServer(
           recursionReasons,
         )
       } catch (authError: any) {
+        completeAuthorization?.(false)
         log('Authorization error:', authError)
         debugLog('Authorization error during finishAuth', {
           errorMessage: authError.message,
@@ -2504,6 +2503,7 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
 
   // OAuth callback endpoint
   app.get(options.path, (req, res) => {
+    res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' })
     const code = req.query.code as string | undefined
     const state = req.query.state as string | undefined
     const iss = req.query.iss as string | undefined
@@ -2511,7 +2511,13 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
     if (authorizationError) {
       const description = (req.query.error_description as string | undefined) ?? authorizationError
       log(`Authorization failed: ${authorizationError} - ${description}`)
-      res.status(400).send(`Authorization failed: ${description}\n\nYou may close this window and return to the CLI.`)
+      res
+        .status(400)
+        .send(
+          options.authSuccessUrl
+            ? 'Authorization failed. You may close this window and return to the CLI.'
+            : `Authorization failed: ${description}\n\nYou may close this window and return to the CLI.`,
+        )
       options.events.emit('auth-code-failed', new Error(`Authorization failed: ${authorizationError} - ${description}`))
       return
     }
@@ -2521,9 +2527,32 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
     }
 
     const received: AuthCodeResult = { code, state, iss }
-    authEverCompleted = true
+    if (options.authSuccessUrl) {
+      // The code arriving is not proof of authorization: wait for finishAuth to validate it and save tokens.
+      const timeout = setTimeout(() => {
+        if (!res.writableEnded && !res.destroyed) {
+          res.status(504).send('Authorization timed out. You may close this window and try again from the CLI.')
+        }
+      }, options.authTimeoutMs ?? 30000)
+      res.once('close', () => clearTimeout(timeout))
+      let finished = false
+      received.completeAuthorization = (success) => {
+        if (finished) return
+        finished = true
+        clearTimeout(timeout)
+        if (success) {
+          authEverCompleted = true
+          authCompletedResolve(received)
+        }
+        if (res.writableEnded || res.destroyed) return
+        if (success) res.status(303).set('Location', options.authSuccessUrl!).end()
+        else res.status(502).send('Authorization failed. You may close this window and try again from the CLI.')
+      }
+    } else {
+      authEverCompleted = true
+      authCompletedResolve(received)
+    }
     log('Auth code received, resolving promise')
-    authCompletedResolve(received)
 
     // Hand it straight to whoever is waiting; hold it only if nobody is yet. The startup flow
     // reaches `waitForAuthCode` after the browser has already been sent here, so both orders happen.
@@ -2531,7 +2560,8 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
     if (waiter) waiter.resolve(received)
     else unclaimedCodes.push(received)
 
-    res.send(`
+    if (!options.authSuccessUrl)
+      res.send(`
       Authorization successful!
       You may close this window and return to the CLI.
       <script>
@@ -2942,6 +2972,34 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
 
+  let authSuccessUrl: string | undefined
+  const authSuccessIndex = args.indexOf('--auth-success-url')
+  if (authSuccessIndex !== -1) {
+    const value = args[authSuccessIndex + 1]
+    const invalid = () => {
+      throw new Error(
+        '--auth-success-url requires one HTTPS URL (or HTTP on loopback/with --allow-http), without credentials, query or fragment',
+      )
+    }
+    if (!value || value.startsWith('--') || args.lastIndexOf('--auth-success-url') !== authSuccessIndex) invalid()
+    let url: URL
+    try {
+      url = new URL(value)
+    } catch {
+      return invalid()
+    }
+    const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+    if (
+      (url.protocol !== 'https:' && !(url.protocol === 'http:' && (loopback || allowHttp))) ||
+      url.username ||
+      url.password ||
+      value.includes('?') ||
+      value.includes('#')
+    )
+      invalid()
+    authSuccessUrl = url.href
+  }
+
   let staticOAuthClientMetadata: StaticOAuthClientMetadata = null
   const staticOAuthClientMetadataIndex = args.indexOf('--static-oauth-client-metadata')
   if (staticOAuthClientMetadataIndex !== -1 && staticOAuthClientMetadataIndex < args.length - 1) {
@@ -3194,6 +3252,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     serverUrlHash,
     keepAlive,
     protocolMode,
+    authSuccessUrl,
   }
 }
 
