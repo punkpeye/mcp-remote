@@ -2511,7 +2511,8 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
     if (authorizationError) {
       const description = (req.query.error_description as string | undefined) ?? authorizationError
       log(`Authorization failed: ${authorizationError} - ${description}`)
-      res.status(400).send(`Authorization failed: ${description}\n\nYou may close this window and return to the CLI.`)
+      // error_description is attacker-controlled; send it as plain text so markup cannot execute
+      res.status(400).type('text/plain').send(`Authorization failed: ${description}\n\nYou may close this window and return to the CLI.`)
       options.events.emit('auth-code-failed', new Error(`Authorization failed: ${authorizationError} - ${description}`))
       return
     }
