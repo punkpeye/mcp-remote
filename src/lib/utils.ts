@@ -289,6 +289,9 @@ function isRejectedAfterAuthorizing(error: unknown): boolean {
 export async function forgetRejectedAuthorization(authProvider: OAuthClientProvider): Promise<void> {
   try {
     await authProvider.invalidateCredentials?.('tokens')
+    // The refusal may mean the server moved to another authorization server, and the SDK leaves
+    // dropping its cached discovery to the host on repeated 401s
+    await authProvider.invalidateCredentials?.('discovery')
   } catch (error) {
     debugLog('Could not discard the refused token', error)
   }

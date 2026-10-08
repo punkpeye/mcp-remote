@@ -145,6 +145,8 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
     it('lets the SDK clear and re-register a cached dynamic client once', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
+      // The persisted discovery state is read first inside auth()
+      mockReadJsonFile.mockResolvedValueOnce(undefined)
       mockReadJsonFile.mockResolvedValueOnce({
         client_id: 'stale-client',
         redirect_uris: ['http://localhost:8080/oauth/callback'],
