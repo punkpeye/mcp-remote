@@ -136,8 +136,9 @@ describe('connectToRemoteServer', () => {
 
     await connectToRemoteServer(null, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first')
 
-    // Then the refused token is thrown away
+    // Then the refused token is thrown away, with the discovery that pointed at its issuer
     expect(invalidateCredentials).toHaveBeenCalledWith('tokens')
+    expect(invalidateCredentials).toHaveBeenCalledWith('discovery')
 
     // And it reconnected rather than failing at startup. Nothing has to be reset on the transport
     // for that: the SDK scopes its "already tried authorizing" flag to a single send, so the
@@ -160,7 +161,7 @@ describe('connectToRemoteServer', () => {
       connectToRemoteServer(null, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first'),
     ).rejects.toThrow('401 after re-authentication')
 
-    expect(authProvider.invalidateCredentials).toHaveBeenCalledTimes(1)
+    expect(authProvider.invalidateCredentials.mock.calls).toEqual([['tokens'], ['discovery']])
   })
 
   it('completes auth on the main transport in with-client mode (parity with the working standalone client path)', async () => {
