@@ -2366,7 +2366,9 @@ export async function connectToRemoteServer(
           authProvider.useAuthorizationState(state)
         }
 
-        // An authorization code is single-use; reject a spent retry budget before exchanging it.
+        // Checked before the exchange, not after: an authorization code is single-use (RFC 6749
+        // 4.1.2) and the callback server hands back the same retained code on a second call, so
+        // exchanging it again fails with invalid_grant and masks this message.
         giveUpIfAlreadyRetried()
         log('Completing authorization...')
         // Complete auth on the transport that received the 401 challenge (in proxy mode this is the
@@ -2511,8 +2513,10 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
     if (authorizationError) {
       const description = (req.query.error_description as string | undefined) ?? authorizationError
       log(`Authorization failed: ${authorizationError} - ${description}`)
+      // error_description is attacker-controlled; send it as plain text so markup cannot execute
       res
         .status(400)
+        .type('text/plain')
         .send(
           options.authSuccessUrl
             ? 'Authorization failed. You may close this window and return to the CLI.'

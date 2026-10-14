@@ -2745,6 +2745,34 @@ describe('setupOAuthCallbackServerWithLongPoll', () => {
     expect((await settled).message).toMatch(/access_denied/)
   })
 
+  it('returns an authorization error as plain text, not HTML the browser would render', async () => {
+    // error_description is attacker-controlled: a malicious authorization server can put markup
+    // in it. Express res.send(string) defaults to text/html, so without an explicit type the
+    // description would execute as script in the browser showing the callback page.
+    const result = await setupOAuthCallbackServerWithLongPoll({
+      port: 0,
+      path: '/oauth/callback',
+      events,
+      serverUrlHash: 'test-hash',
+    })
+    server = result.server
+    const settled = result.waitForAuthCode().then(
+      () => new Error('expected no authorization code'),
+      (error: Error) => error,
+    )
+
+    const payload = '<script>alert(1)</script>'
+    const response = await fetch(
+      `http://127.0.0.1:${result.actualPort}/oauth/callback?error=access_denied&error_description=${encodeURIComponent(payload)}`,
+    )
+
+    expect(response.status).toBe(400)
+    expect(response.headers.get('content-type')).toMatch(/^text\/plain/)
+    // The description is still echoed for readability - it is inert as plain text
+    await expect(response.text()).resolves.toContain(payload)
+    expect((await settled).message).toMatch(/access_denied/)
+  })
+
   it('answers an identity probe, so a losing instance can tell a sibling from a stranger', async () => {
     const result = await setupOAuthCallbackServerWithLongPoll({
       port: 0,

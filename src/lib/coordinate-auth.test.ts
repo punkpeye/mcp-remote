@@ -106,22 +106,38 @@ describe('Feature: Deciding who runs the sign-in', () => {
     await sibling(port)
     await writeJsonFile(HASH, 'tokens.json', { access_token: 'stale', token_type: 'Bearer', expires_at: Date.now() - 60_000 })
 
-    const result = await coordinate(port, 400)
-
-    // It waited instead, then gave up - and gave up without claiming a sign-in had happened
-    expect(result.actualPort).toBe(port)
-    await expect(result.waitForAuthCode()).rejects.toThrow(/does not own the sign-in/)
-    result.server.close()
+    await expect(coordinate(port, 400)).rejects.toThrow(/Authentication is still pending in another instance/)
   })
 
-  it('Scenario: Giving up on another instance does not kill this one', async () => {
-    // Every way "is a sibling signing in?" can be guessed wrong used to end in exit(1)
+  it('Scenario: An unanswered sign-in stops the follower instead of authorizing without ownership', async () => {
     const port = await freePort()
     await sibling(port)
 
-    const result = await coordinate(port, 400)
+    await expect(coordinate(port, 400)).rejects.toThrow(/Complete that sign-in and retry/)
+  })
 
-    expect(result).toBeDefined()
+  it('Scenario: A sign-in completed while the follower waits allows it to reconnect', async () => {
+    const port = await freePort()
+    await sibling(port)
+    const pending = coordinate(port)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    await writeJsonFile(HASH, 'tokens.json', { access_token: 'new', token_type: 'Bearer', expires_at: Date.now() + 3_600_000 })
+
+    const result = await pending
+    expect(result.skipBrowserAuth).toBe(true)
+    result.server.close()
+  })
+
+  it('Scenario: The follower takes over when the owner exits without completing login', async () => {
+    const port = await freePort()
+    await sibling(port)
+    const owner = opened.pop()!
+    const pending = coordinate(port)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    await owner.close()
+
+    const result = await pending
+    expect(result.skipBrowserAuth).toBe(false)
     expect(result.actualPort).toBe(port)
     result.server.close()
   })

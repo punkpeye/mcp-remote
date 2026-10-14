@@ -5,12 +5,14 @@ const mocked = vi.hoisted(() => {
   const finishAuth = vi.fn()
   const useAuthorizationState = vi.fn()
   const initializeAuth = vi.fn()
-  const createLazyAuthCoordinator = vi.fn(() => ({ initializeAuth }))
+  const release = vi.fn()
+  const createLazyAuthCoordinator = vi.fn(() => ({ initializeAuth, release }))
   return {
     completeAuthorization,
     finishAuth,
     useAuthorizationState,
     initializeAuth,
+    release,
     createLazyAuthCoordinator,
     remoteTransport: { finishAuth } as { finishAuth?: typeof finishAuth },
     reauthorize: undefined as (() => Promise<void>) | undefined,
@@ -136,5 +138,15 @@ describe('proxy OAuth browser completion', () => {
     await mocked.reauthorize!()
     expect(waitForAuthCode).not.toHaveBeenCalled()
     expect(mocked.completeAuthorization).not.toHaveBeenCalled()
+  })
+
+  it('gives the callback port back after a mid-session sign-in, owned or followed', async () => {
+    mocked.release.mockClear()
+    await mocked.reauthorize!()
+    expect(mocked.release).toHaveBeenCalledTimes(1)
+
+    mocked.initializeAuth.mockResolvedValue({ actualPort: 3600, server: {}, skipBrowserAuth: true, waitForAuthCode: vi.fn() })
+    await mocked.reauthorize!()
+    expect(mocked.release).toHaveBeenCalledTimes(2)
   })
 })

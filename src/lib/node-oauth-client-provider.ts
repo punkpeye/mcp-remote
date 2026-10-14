@@ -1,5 +1,11 @@
 import { z } from 'zod'
-import { OAuthClientInformationFullSchema, OAuthTokensSchema } from '@modelcontextprotocol/core'
+import {
+  OAuthClientInformationFullSchema,
+  OAuthMetadataSchema,
+  OAuthProtectedResourceMetadataSchema,
+  OAuthTokensSchema,
+  OpenIdProviderDiscoveryMetadataSchema,
+} from '@modelcontextprotocol/core'
 import {
   auth,
   OAuthError,
@@ -80,6 +86,28 @@ export const OAuthTokensWithExpiresAtSchema: TokenStoreSchema = OAuthTokensSchem
   issuer: z.string().optional(),
 })
 
+/**
+ * The discovery document the SDK hands {@link NodeOAuthClientProvider.saveDiscoveryState} has
+ * already been validated - as RFC 8414 or OIDC discovery - so the file is read back under those
+ * same two shapes. Anything else on disk is treated as absent and discovered fresh.
+ */
+const DiscoveryStateSchema = z.looseObject({
+  authorizationServerUrl: z.string(),
+  resourceMetadataUrl: z.string().optional(),
+  authorizationServerMetadata: z.union([OAuthMetadataSchema, OpenIdProviderDiscoveryMetadataSchema]).optional(),
+  resourceMetadata: OAuthProtectedResourceMetadataSchema.optional(),
+})
+
+/**
+ * {@link OAuthClientInformationFull} as persisted on disk. The SDK stamps the authorization
+ * server's `issuer` onto the registration it saves (SEP-2352) and reads it back to check the
+ * stored client still names that server, so the stamp has to survive the schema - without it the
+ * SDK reports "no 'issuer' stamp" and re-saves the registration on every sign-in.
+ */
+const ClientInformationStoreSchema = OAuthClientInformationFullSchema.extend({
+  issuer: z.string().optional(),
+})
+
 const FALLBACK_SCOPE = 'openid email profile'
 
 /** The shape of the state we issue, and the only shape accepted into a config filename. */
@@ -114,6 +142,12 @@ const TOKEN_EXPIRY_MARGIN_MS = 60_000
 
 /** The lease that keeps a rotating refresh token to one use per host. See {@link refreshOncePerHost}. */
 const REFRESH_LEASE_FILE = 'refresh_in_progress.json'
+
+/**
+ * Where the authorization-server discovery behind a redirect survives for the callback leg, one
+ * file per flow like the verifier it travels with.
+ */
+const DISCOVERY_STATE_PREFIX = 'discovery_state_'
 
 /**
  * How long an instance may hold the refresh lease.
@@ -253,6 +287,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * arm's redirect among the several that follow. See {@link CONCURRENT_FLOW_WINDOW_MS}.
    */
   private pendingFlow: { state: string; startedAt: number; challenge?: string } | null = null
+  /** The discovery the next redirect is built from, until {@link saveCodeVerifier} files it under its flow. */
+  private flowDiscovery: OAuthDiscoveryState | undefined
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -316,21 +352,60 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     return buildRedirectUrl(this.options.host, this.options.callbackPort, this.callbackPath)
   }
 
-  discoveryState(): OAuthDiscoveryState | undefined {
-    if (!this.hasExplicitTokenEndpoint) return undefined
-    const endpoint = new URL(this.options.tokenEndpoint!)
-    return {
-      authorizationServerUrl: endpoint.origin,
-      authorizationServerMetadata: {
-        issuer: endpoint.origin,
-        token_endpoint: endpoint.href,
-        grant_types_supported: ['client_credentials'],
-        // The SDK types full OAuth/OIDC documents, but this grant has no authorization endpoint.
-      } as unknown as OAuthDiscoveryState['authorizationServerMetadata'],
-      // Both layers must be present: the SDK otherwise still probes protected-resource metadata
-      // after a 401, even when the authorization server and token endpoint are already known.
-      resourceMetadata: { resource: this.resourceServerUrl, authorization_servers: [endpoint.origin] },
+  /**
+   * The authorization-server discovery behind the current sign-in.
+   *
+   * For the authorization-code flow this is what {@link saveCodeVerifier} persisted for the flow
+   * being redeemed, so the callback leg - possibly in whichever process ended up holding the
+   * callback port - can check that the server which issued the code is the one it is redeemed
+   * against (SEP-2352). With an explicit token endpoint there is no discovery and nothing to read
+   * back: the state is synthesized from configuration.
+   *
+   * Scoped to a flow rather than kept as a cache. The SDK prefers a cached state over a live
+   * challenge, so one that outlived its sign-in would pin a server that moved to another
+   * authorization server to the old one - and nothing here would ever notice, since that server
+   * never hands out a token to be refused. Outside a sign-in there is nothing to read, and the SDK
+   * discovers afresh as it always has.
+   */
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    if (this.hasExplicitTokenEndpoint) {
+      const endpoint = new URL(this.options.tokenEndpoint!)
+      return {
+        authorizationServerUrl: endpoint.origin,
+        authorizationServerMetadata: {
+          issuer: endpoint.origin,
+          token_endpoint: endpoint.href,
+          grant_types_supported: ['client_credentials'],
+          // The SDK types full OAuth/OIDC documents, but this grant has no authorization endpoint.
+        } as unknown as OAuthDiscoveryState['authorizationServerMetadata'],
+        // Both layers must be present: the SDK otherwise still probes protected-resource metadata
+        // after a 401, even when the authorization server and token endpoint are already known.
+        resourceMetadata: { resource: this.resourceServerUrl, authorization_servers: [endpoint.origin] },
+      }
     }
+
+    // Whatever the SDK goes on to use, so a redirect it builds from this is recorded under its flow
+    this.flowDiscovery = await readJsonFile<OAuthDiscoveryState>(
+      this.serverUrlHash,
+      this.discoveryStateFile(this.flowState),
+      DiscoveryStateSchema,
+    )
+    return this.flowDiscovery
+  }
+
+  /**
+   * Holds the discovery the SDK just ran until {@link saveCodeVerifier} writes it.
+   *
+   * The SDK saves it before it asks for the flow's state, so there is no flow to file it under yet.
+   * It needs the same durability as the code verifier - the redirect may complete in a different
+   * process, which reads it back off disk - and is written alongside it.
+   *
+   * The explicit-token-endpoint flow performs no discovery, so the only state it could record is
+   * the synthesized state above, which needs no persisting.
+   */
+  async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
+    if (this.hasExplicitTokenEndpoint) return
+    this.flowDiscovery = state
   }
 
   async prepareTokenRequest(scope?: string): Promise<URLSearchParams | undefined> {
@@ -597,10 +672,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return clientIdMetadataDocument
     }
 
-    const clientInfo = await readJsonFile<OAuthClientInformationFull>(
+    const clientInfo = await readJsonFile<OAuthClientInformationFull & { issuer?: string }>(
       this.serverUrlHash,
       'client_info.json',
-      OAuthClientInformationFullSchema,
+      ClientInformationStoreSchema,
     )
 
     if (clientInfo) {
@@ -1108,9 +1183,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     await writeJsonFile(this.serverUrlHash, 'tokens.json', tokensToSave)
 
-    // The flow is over, and its verifier is named after a state nothing will use again
+    // The flow is over, and its verifier and discovery are named after a state nothing will use again
     await deleteConfigFile(this.serverUrlHash, this.codeVerifierFile(this.flowState))
+    await deleteConfigFile(this.serverUrlHash, this.discoveryStateFile(this.flowState))
     await deleteStaleConfigFiles(this.serverUrlHash, CODE_VERIFIER_PREFIX, ABANDONED_FLOW_AGE_MS)
+    await deleteStaleConfigFiles(this.serverUrlHash, DISCOVERY_STATE_PREFIX, ABANDONED_FLOW_AGE_MS)
 
     // Closes the window early, so the next 401 opens a browser instead of joining a flow that has
     // already finished
@@ -1376,7 +1453,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     }
 
     debugLog('Saving code verifier')
-    await writeTextFile(this.serverUrlHash, this.codeVerifierFile(flow?.state ?? this._state), codeVerifier)
+    const state = flow?.state ?? this._state
+    await writeTextFile(this.serverUrlHash, this.codeVerifierFile(state), codeVerifier)
+    // The callback leg checks the code against the authorization server this redirect was built
+    // from (SEP-2352), in whichever instance holds the callback port by then
+    if (this.flowDiscovery) {
+      debugLog('Saving OAuth discovery state', { state })
+      await writeJsonFile(this.serverUrlHash, this.discoveryStateFile(state), this.flowDiscovery)
+    }
     if (flow) flow.challenge = codeChallengeFor(codeVerifier)
   }
 
@@ -1417,6 +1501,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     return `${CODE_VERIFIER_PREFIX}${state}.txt`
   }
 
+  private discoveryStateFile(state: string): string {
+    return `${DISCOVERY_STATE_PREFIX}${state}.json`
+  }
+
   /**
    * Gets the PKCE code verifier
    * @returns The code verifier
@@ -1432,7 +1520,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * Invalidates the specified credentials
    * @param scope The scope of credentials to invalidate
    */
-  async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier'): Promise<void> {
+  async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery'): Promise<void> {
     debugLog(`Invalidating credentials: ${scope}`)
 
     switch (scope) {
@@ -1441,10 +1529,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
           deleteConfigFile(this.serverUrlHash, 'client_info.json'),
           deleteConfigFile(this.serverUrlHash, 'tokens.json'),
           deleteConfigFile(this.serverUrlHash, this.codeVerifierFile(this.flowState)),
+          deleteConfigFile(this.serverUrlHash, this.discoveryStateFile(this.flowState)),
         ])
         this._clientInfo = undefined
         this.clientRegistrationSource = undefined
         this.pendingFlow = null
+        this.flowDiscovery = undefined
         debugLog('All credentials invalidated')
         break
 
@@ -1462,8 +1552,15 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
       case 'verifier':
         await deleteConfigFile(this.serverUrlHash, this.codeVerifierFile(this.flowState))
+        await deleteConfigFile(this.serverUrlHash, this.discoveryStateFile(this.flowState))
         this.pendingFlow = null
         debugLog('Code verifier invalidated')
+        break
+
+      case 'discovery':
+        await deleteConfigFile(this.serverUrlHash, this.discoveryStateFile(this.flowState))
+        this.flowDiscovery = undefined
+        debugLog('Discovery state invalidated')
         break
 
       default:

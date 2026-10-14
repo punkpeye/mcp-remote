@@ -7,7 +7,7 @@ import { Server } from 'http'
 import express from 'express'
 import { log, debugLog, setupOAuthCallbackServerWithLongPoll, MCP_REMOTE_ID_PATH } from './utils'
 
-/** How long to wait on another instance's sign-in before going it alone. Sign-ins involve a human. */
+/** How long to wait on another instance's sign-in before reporting it is still pending. */
 const FOLLOWER_PATIENCE_MS = 3 * 60_000
 
 /**
@@ -29,6 +29,15 @@ export type AuthCoordinator = {
     skipBrowserAuth: boolean
     actualPort: number
   }>
+  /**
+   * Gives the callback port back once a sign-in has finished.
+   *
+   * The port is what makes an instance the owner of a sign-in, and siblings wait on whoever holds
+   * it. Kept for the rest of the process, it outlives the sign-in it was bound for: a later instance
+   * that needs its own sign-in - the shared tokens expired overnight, say - waits on an owner that
+   * is not signing anyone in, until it gives up minutes later. The next 401 coordinates afresh.
+   */
+  release: () => Promise<void>
 }
 
 /**
@@ -60,7 +69,18 @@ export function createLazyAuthCoordinator(
     actualPort: number
   }> | null = null
 
+  /** Forgets the cached verdict and waits until the callback server it carries has stopped listening */
+  const closeHeld = async () => {
+    const held = authState
+    authState = null
+    // Awaited, not fired and forgotten: the port has to be free before anything tries to bind it
+    // again, or that bind races this close and can still find the socket being given up.
+    await held?.then(({ server }) => new Promise<void>((resolve) => server.close(() => resolve()))).catch(() => {})
+  }
+
   return {
+    release: closeHeld,
+
     initializeAuth: async (options) => {
       let refreshed = false
 
@@ -74,12 +94,7 @@ export function createLazyAuthCoordinator(
         // handle to it once this is nulled. Left open it both leaks a socket and answers the port
         // probe of the very `coordinateAuth` about to run - so this instance would find "a sibling"
         // on the port, and the sibling would be itself.
-        const stale = authState
-        authState = null
-        // Awaited, not fired and forgotten: the port has to be free before the fresh
-        // `coordinateAuth` below tries to bind it, or that bind races this close and can still
-        // find the socket this instance is in the middle of giving up.
-        await stale.then(({ server }) => new Promise<void>((resolve) => server.close(() => resolve()))).catch(() => {})
+        await closeHeld()
       }
 
       if (authState) {
@@ -317,7 +332,7 @@ async function followUntilTokensOrPort(
   authSuccessUrl?: string,
 ): Promise<{ server: Server; actualPort: number; waitForAuthCode: () => Promise<AuthCodeResult>; skipBrowserAuth: boolean }> {
   // The person at the browser may be going through SSO, MFA or a password manager, so this is
-  // deliberately longer than the handoff window - and running out is no longer fatal.
+  // deliberately longer than the handoff window.
   const deadline = Date.now() + Math.max(authTimeoutMs, followerPatienceMs)
 
   while (Date.now() < deadline) {
@@ -348,11 +363,13 @@ async function followUntilTokensOrPort(
     await new Promise((resolve) => setTimeout(resolve, FOLLOWER_POLL_INTERVAL_MS))
   }
 
-  // Whatever we were waiting for is not coming. Connecting unaided may still work - the server
-  // may not need OAuth at all, or may challenge us and let the 401 handler run - and it is always
-  // better than exiting, which is what a wrong guess used to cost.
-  log(`Gave up waiting for another instance on port ${port}; continuing without owning the sign-in`)
-  return unownedFlow(port)
+  // A timeout is not a completed login. Returning skipBrowserAuth here lets the caller start
+  // an authenticated transport without tokens; the SDK opens another tab before its 401 handler
+  // can check ownership. Only a usable token above permits a follower to reconnect.
+  throw new Error(
+    `Authentication is still pending in another instance on port ${port}. ` +
+      'Complete that sign-in and retry, or close the other instance to start a new sign-in.',
+  )
 }
 
 /**

@@ -66,6 +66,12 @@ export async function startOAuthSimulator(): Promise<OAuthSimulator> {
   const clients = new Map<string, Registration>()
   const codes = new Map<string, PendingCode>()
   const spentCodes = new Set<string>()
+  const accessTokens = new Set<string>()
+  const issueAccessToken = () => {
+    const token = `access-${randomUUID()}`
+    accessTokens.add(token)
+    return token
+  }
   const startedAt = Date.now()
   let base = ''
 
@@ -127,7 +133,7 @@ export async function startOAuthSimulator(): Promise<OAuthSimulator> {
 
     if (grantType === 'refresh_token') {
       counters.tokensIssued++
-      res.json({ access_token: `access-${randomUUID()}`, refresh_token: req.body.refresh_token, token_type: 'Bearer', expires_in: 3600 })
+      res.json({ access_token: issueAccessToken(), refresh_token: req.body.refresh_token, token_type: 'Bearer', expires_in: 3600 })
       return
     }
 
@@ -158,7 +164,7 @@ export async function startOAuthSimulator(): Promise<OAuthSimulator> {
     codes.delete(code)
     spentCodes.add(code)
     counters.tokensIssued++
-    res.json({ access_token: `access-${randomUUID()}`, refresh_token: `refresh-${randomUUID()}`, token_type: 'Bearer', expires_in: 3600 })
+    res.json({ access_token: issueAccessToken(), refresh_token: `refresh-${randomUUID()}`, token_type: 'Bearer', expires_in: 3600 })
   })
 
   // The MCP resource server. Unauthenticated requests get the challenge that starts the flow.
@@ -166,7 +172,7 @@ export async function startOAuthSimulator(): Promise<OAuthSimulator> {
   // but actually reached the server with it - the outcome a user would call "it worked".
   app.all('/mcp', (req, res) => {
     const authorization = req.headers.authorization
-    if (!authorization?.startsWith('Bearer ')) {
+    if (!authorization?.startsWith('Bearer ') || !accessTokens.has(authorization.slice('Bearer '.length))) {
       res.setHeader('WWW-Authenticate', `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`)
       res.status(401).json({ error: 'unauthorized' })
       return
