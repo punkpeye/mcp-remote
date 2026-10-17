@@ -99,7 +99,10 @@ describe('Feature: Config file writes', () => {
     expect(leftovers).toEqual([])
   })
 
-  it('Scenario: The file stays owner-only', async () => {
+  // Windows does not report POSIX permission bits: a file created with mode 0o600 comes back as
+  // 0o666, so this assertion can only run where the bits are real. The mode passed to the write is
+  // unchanged - only the check that cannot observe it is skipped.
+  it.skipIf(process.platform === 'win32')('Scenario: The file stays owner-only', async () => {
     await writeJsonFile(hash, filename, { access_token: 'a' })
 
     const stat = await fs.stat(target())
@@ -210,7 +213,9 @@ describe('Feature: Leasing a filename to one instance at a time', () => {
     expect(await acquireConfigLease(hash, filename, TTL)).toBeTruthy()
   })
 
-  it('Scenario: The lease is readable only by its owner', async () => {
+  // Skipped on Windows for the same reason as "The file stays owner-only": the lease is written
+  // with mode 0o600, but fs.stat cannot report it there, so the check cannot fail honestly.
+  it.skipIf(process.platform === 'win32')('Scenario: The lease is readable only by its owner', async () => {
     await acquireConfigLease(hash, filename, TTL)
 
     const mode = (await fs.stat(getConfigFilePath(hash, filename))).mode & 0o777

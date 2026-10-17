@@ -521,8 +521,9 @@ describe('Feature: Command Line Arguments Parsing', () => {
     // When parsing the command line arguments
     const result = await parseCommandLineArgs(args, usage)
 
-    // Then the default host should be localhost
-    expect(result.host).toBe('localhost')
+    // Then the default host should be loopback, named the way this platform listens on it:
+    // Windows uses the IPv4 literal because `localhost` can resolve to ::1 first.
+    expect(result.host).toBe(process.platform === 'win32' ? '127.0.0.1' : 'localhost')
   })
 
   it('Scenario: Default to the IPv4 loopback literal on Windows', async () => {
@@ -4318,10 +4319,11 @@ describe('Feature: Stale Client Registration Invalidation', () => {
   })
 
   it('Scenario: Reuse a registration whose redirect_uri still matches', async () => {
-    // Given a registration made against the port this server derives
+    // Given a registration made against the port this server derives, on the host it will use
     const serverUrl = 'https://reuse.example.com/mcp'
     const derivedPort = calculateDefaultPort(getServerUrlHash(serverUrl))
-    writeRegistration(serverUrl, [`http://localhost:${derivedPort}/oauth/callback`])
+    const defaultHost = process.platform === 'win32' ? '127.0.0.1' : 'localhost'
+    writeRegistration(serverUrl, [`http://${defaultHost}:${derivedPort}/oauth/callback`])
 
     // When starting with no port override
     const result = await parseCommandLineArgs([serverUrl], 'test usage')
