@@ -1577,9 +1577,16 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         break
 
       case 'client':
-        await deleteConfigFile(this.serverUrlHash, 'client_info.json')
+        // A sign-in under way was started for the client being dropped, so no code it produces can
+        // be redeemed. Left pending, it would suppress the redirect for the client registered next.
+        await Promise.all([
+          deleteConfigFile(this.serverUrlHash, 'client_info.json'),
+          deleteConfigFile(this.serverUrlHash, this.codeVerifierFile(this.flowState)),
+          deleteConfigFile(this.serverUrlHash, this.discoveryStateFile(this.flowState)),
+        ])
         this._clientInfo = undefined
         this.clientRegistrationSource = undefined
+        this.pendingFlow = null
         debugLog('Client information invalidated')
         break
 

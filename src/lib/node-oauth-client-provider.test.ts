@@ -198,6 +198,64 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(requests.filter((request) => request.startsWith('GET https://example.com/authorize?'))).toHaveLength(1)
     })
 
+    it('opens the browser for the new registration after the stale one is cleared', async () => {
+      const { default: open } = await import('open')
+      const openedUrls: string[] = []
+      vi.mocked(open).mockImplementation(async (url: string) => {
+        openedUrls.push(url)
+        return {} as any
+      })
+      vi.mocked(mcpAuthConfig.writeTextFile).mockResolvedValue(undefined)
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      // The persisted discovery state is read first inside auth()
+      mockReadJsonFile.mockResolvedValueOnce(undefined)
+      mockReadJsonFile.mockResolvedValueOnce({
+        client_id: 'stale-client',
+        redirect_uris: ['http://localhost:8080/oauth/callback'],
+      })
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = input.toString()
+
+        if (url === 'https://example.com/.well-known/oauth-protected-resource') {
+          return new Response(null, { status: 404 })
+        }
+        if (url === 'https://example.com/.well-known/oauth-authorization-server') {
+          return Response.json({
+            issuer: 'https://example.com',
+            authorization_endpoint: 'https://example.com/authorize',
+            token_endpoint: 'https://example.com/token',
+            registration_endpoint: 'https://example.com/register',
+            response_types_supported: ['code'],
+          })
+        }
+        if (url === 'https://example.com/register') {
+          return Response.json(
+            {
+              client_id: 'fresh-client',
+              redirect_uris: ['http://localhost:8080/oauth/callback'],
+            },
+            { status: 201 },
+          )
+        }
+        if (url.startsWith('https://example.com/authorize?')) {
+          return Response.json({ error: 'invalid_client' }, { status: 400 })
+        }
+
+        throw new Error(`Unexpected request: ${url}`)
+      })
+      vi.stubGlobal('fetch', fetchFn)
+
+      await auth(provider, { serverUrl: new URL(defaultOptions.serverUrl), fetchFn })
+
+      // The retry is a new sign-in for a new client. The stale client's flow must not suppress it,
+      // and the verifier on disk must be the one the browser's challenge was made from.
+      expect(openedUrls).toHaveLength(1)
+      const opened = new URL(openedUrls[0])
+      expect(opened.searchParams.get('client_id')).toBe('fresh-client')
+      const savedVerifier = vi.mocked(mcpAuthConfig.writeTextFile).mock.calls.at(-1)?.[2]
+      expect(opened.searchParams.get('code_challenge')).toBe(createHash('sha256').update(savedVerifier!).digest('base64url'))
+    })
+
     it('does not infer a stale registration from error_description text', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
       mockReadJsonFile.mockResolvedValueOnce({
