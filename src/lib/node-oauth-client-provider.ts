@@ -1577,15 +1577,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         break
 
       case 'client':
-        // A sign-in under way was started for the client being dropped, so no code it produces can
-        // be redeemed. Left pending, it would suppress the redirect for the client registered next.
-        await Promise.all([
-          deleteConfigFile(this.serverUrlHash, 'client_info.json'),
-          deleteConfigFile(this.serverUrlHash, this.codeVerifierFile(this.flowState)),
-          deleteConfigFile(this.serverUrlHash, this.discoveryStateFile(this.flowState)),
-        ])
+        await deleteConfigFile(this.serverUrlHash, 'client_info.json')
         this._clientInfo = undefined
         this.clientRegistrationSource = undefined
+        // A sign-in under way was started for the client being dropped, so no code it produces can
+        // be redeemed. Left pending, it would suppress the redirect for the client registered next.
+        // Its files are left for saveTokens to sweep: the SDK also drops a client the token endpoint
+        // refuses and retries the exchange, which reads them - without them, a wrong client secret
+        // is reported as the authorization server having changed.
         this.pendingFlow = null
         debugLog('Client information invalidated')
         break
