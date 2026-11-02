@@ -76,6 +76,8 @@ export interface OAuthCallbackServerOptions {
   authTimeoutMs?: number
   /** Optional browser destination after the authorization code has been exchanged successfully. */
   authSuccessUrl?: string
+  /** Address the callback server listens on (127.0.0.1 unless overridden) */
+  bindHost?: string
   /** Identifies which server this callback server belongs to, for the identity probe */
   serverUrlHash: string
 }

@@ -45,6 +45,7 @@ vi.mock('./lib/utils', () => ({
     authTimeoutMs: 1000,
     serverUrlHash: 'proxy-completion',
     authSuccessUrl: 'https://app.example.com/cli-connected',
+    bindHost: '0.0.0.0',
   }),
   connectToRemoteServer: vi.fn(async () => mocked.remoteTransport),
   discoverOAuthServerInfo: vi.fn().mockResolvedValue({ authorizationServerUrl: 'https://issuer.example.com' }),
@@ -81,7 +82,7 @@ describe('proxy OAuth browser completion', () => {
     await vi.waitUntil(() => mocked.reauthorize !== undefined)
   })
 
-  it('forwards the CLI option without changing the callback path or port', () => {
+  it('forwards the CLI options without changing the callback path or port', () => {
     expect(mocked.createLazyAuthCoordinator).toHaveBeenCalledWith(
       'proxy-completion',
       '/custom/callback',
@@ -90,6 +91,7 @@ describe('proxy OAuth browser completion', () => {
       1000,
       true,
       'https://app.example.com/cli-connected',
+      '0.0.0.0',
     )
   })
 

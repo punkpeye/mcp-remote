@@ -28,15 +28,24 @@ async function stranger(port: number): Promise<void> {
 }
 
 /** Something claiming to be one of us for this server, holding a port. */
-async function sibling(port: number, serverUrlHash = HASH): Promise<void> {
+async function sibling(port: number, serverUrlHash = HASH, host = '127.0.0.1'): Promise<void> {
   const app = express()
   app.get(MCP_REMOTE_ID_PATH, (_req, res) => {
     res.json({ mcpRemote: true, serverUrlHash })
   })
   const server = await new Promise<http.Server>((resolve) => {
-    const s = app.listen(port, '127.0.0.1', () => resolve(s))
+    const s = app.listen(port, host, () => resolve(s))
   })
   opened.push({ close: () => new Promise((r) => (server.closeAllConnections(), server.close(() => r()))) })
+}
+
+/** Whether this machine can listen on an address - some containers have no IPv6 loopback. */
+async function canBind(host: string): Promise<boolean> {
+  const probe = net.createServer()
+  return new Promise((resolve) => {
+    probe.once('error', () => resolve(false))
+    probe.listen(0, host, () => probe.close(() => resolve(true)))
+  })
 }
 
 async function freePort(): Promise<number> {
@@ -114,6 +123,18 @@ describe('Feature: Deciding who runs the sign-in', () => {
     await sibling(port)
 
     await expect(coordinate(port, 400)).rejects.toThrow(/Complete that sign-in and retry/)
+  })
+
+  it('Scenario: A sibling on a specific --bind-host is asked there, not on 127.0.0.1', async (ctx) => {
+    // Asked on the wrong address it never answers, so it is stepped over like a stranger and a
+    // second sign-in opens a second tab
+    if (!(await canBind('::1'))) ctx.skip()
+    const port = await freePort()
+    await sibling(port, HASH, '::1')
+
+    await expect(coordinateAuth(HASH, '/oauth/callback', port, new EventEmitter(), 1000, false, 400, undefined, '::1')).rejects.toThrow(
+      /still pending in another instance/,
+    )
   })
 
   it('Scenario: A sign-in completed while the follower waits allows it to reconnect', async () => {

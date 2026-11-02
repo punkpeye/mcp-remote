@@ -5,7 +5,7 @@ import { EventEmitter } from 'events'
 import { Agent } from 'undici'
 import { Server } from 'http'
 import express from 'express'
-import { log, debugLog, setupOAuthCallbackServerWithLongPoll, MCP_REMOTE_ID_PATH } from './utils'
+import { log, debugLog, setupOAuthCallbackServerWithLongPoll, MCP_REMOTE_ID_PATH, DEFAULT_BIND_HOST, formatHostForUrl } from './utils'
 
 /** How long to wait on another instance's sign-in before reporting it is still pending. */
 const FOLLOWER_PATIENCE_MS = 3 * 60_000
@@ -57,6 +57,7 @@ export function createLazyAuthCoordinator(
   authTimeoutMs: number,
   strictPort = false,
   authSuccessUrl?: string,
+  bindHost = DEFAULT_BIND_HOST,
 ): AuthCoordinator {
   // The in-flight promise is what gets shared, not the resolved value. Guarding on the result
   // only rules out sequential re-entry: two 401s landing in the same tick would both find it
@@ -114,6 +115,7 @@ export function createLazyAuthCoordinator(
         strictPort,
         refreshed ? REFRESH_FOLLOWER_PATIENCE_MS : undefined,
         authSuccessUrl,
+        bindHost,
       )
       try {
         const resolved = await authState
@@ -158,9 +160,17 @@ const FOLLOWER_POLL_INTERVAL_MS = 250
  */
 const loopbackDispatcher = new Agent()
 
-async function portHeldBySiblingFor(port: number, serverUrlHash: string): Promise<boolean> {
+/**
+ * Where to reach a callback server bound to `bindHost`. A wildcard bind also listens on loopback;
+ * a specific address may not, so that one has to be asked directly.
+ */
+function probeHostFor(bindHost: string): string {
+  return bindHost === '0.0.0.0' || bindHost === '::' ? '127.0.0.1' : formatHostForUrl(bindHost)
+}
+
+async function portHeldBySiblingFor(port: number, serverUrlHash: string, bindHost: string): Promise<boolean> {
   try {
-    const response = await fetch(`http://127.0.0.1:${port}${MCP_REMOTE_ID_PATH}`, {
+    const response = await fetch(`http://${probeHostFor(bindHost)}:${port}${MCP_REMOTE_ID_PATH}`, {
       signal: AbortSignal.timeout(1000),
       dispatcher: loopbackDispatcher,
     } as RequestInit)
@@ -241,6 +251,7 @@ export async function coordinateAuth(
   strictPort = false,
   followerPatienceMs = FOLLOWER_PATIENCE_MS,
   authSuccessUrl?: string,
+  bindHost = DEFAULT_BIND_HOST,
 ): Promise<{ server: Server; actualPort: number; waitForAuthCode: () => Promise<AuthCodeResult>; skipBrowserAuth: boolean }> {
   debugLog('Coordinating authentication', { serverUrlHash, callbackPath, callbackPort })
 
@@ -257,17 +268,27 @@ export async function coordinateAuth(
         authTimeoutMs,
         serverUrlHash,
         authSuccessUrl,
+        bindHost,
       })
 
       // Binding is only a mutex between instances contending for the *same* port. Instances that
       // were pushed past a port a stranger holds can race onto different candidates and each
       // conclude it won, so a later candidate has to yield to any sibling already established on
       // an earlier one. Lowest bound candidate wins, which every instance can agree on.
-      const established = await firstSiblingBefore(candidates, port, serverUrlHash)
+      const established = await firstSiblingBefore(candidates, port, serverUrlHash, bindHost)
       if (established !== undefined) {
         debugLog('Yielding to a sibling established on an earlier candidate', { ours: actualPort, theirs: established })
         await new Promise<void>((resolve) => server.close(() => resolve()))
-        return followUntilTokensOrPort(serverUrlHash, callbackPath, established, events, authTimeoutMs, followerPatienceMs, authSuccessUrl)
+        return followUntilTokensOrPort(
+          serverUrlHash,
+          callbackPath,
+          established,
+          events,
+          authTimeoutMs,
+          followerPatienceMs,
+          authSuccessUrl,
+          bindHost,
+        )
       }
 
       log(`This instance is running the sign-in for this server (callback port ${actualPort})`)
@@ -283,9 +304,18 @@ export async function coordinateAuth(
         continue
       }
 
-      if (await portHeldBySiblingFor(port, serverUrlHash)) {
+      if (await portHeldBySiblingFor(port, serverUrlHash, bindHost)) {
         log(`Another instance is running the sign-in for this server on port ${port}`)
-        return followUntilTokensOrPort(serverUrlHash, callbackPath, port, events, authTimeoutMs, followerPatienceMs, authSuccessUrl)
+        return followUntilTokensOrPort(
+          serverUrlHash,
+          callbackPath,
+          port,
+          events,
+          authTimeoutMs,
+          followerPatienceMs,
+          authSuccessUrl,
+          bindHost,
+        )
       }
 
       // Somebody else's process. Ours is not there to be waited for, so keep looking.
@@ -308,10 +338,15 @@ export async function coordinateAuth(
  * bound candidate is a rule they can all evaluate identically. Yielding in both directions has no
  * tie-break - two instances would each stand down for the other.
  */
-async function firstSiblingBefore(candidates: number[], port: number, serverUrlHash: string): Promise<number | undefined> {
+async function firstSiblingBefore(
+  candidates: number[],
+  port: number,
+  serverUrlHash: string,
+  bindHost: string,
+): Promise<number | undefined> {
   for (const candidate of candidates) {
     if (candidate === port) return undefined
-    if (await portHeldBySiblingFor(candidate, serverUrlHash)) return candidate
+    if (await portHeldBySiblingFor(candidate, serverUrlHash, bindHost)) return candidate
   }
   return undefined
 }
@@ -330,6 +365,7 @@ async function followUntilTokensOrPort(
   authTimeoutMs: number,
   followerPatienceMs: number,
   authSuccessUrl?: string,
+  bindHost = DEFAULT_BIND_HOST,
 ): Promise<{ server: Server; actualPort: number; waitForAuthCode: () => Promise<AuthCodeResult>; skipBrowserAuth: boolean }> {
   // The person at the browser may be going through SSO, MFA or a password manager, so this is
   // deliberately longer than the handoff window.
@@ -351,6 +387,7 @@ async function followUntilTokensOrPort(
         authTimeoutMs,
         serverUrlHash,
         authSuccessUrl,
+        bindHost,
       })
       // The port came free, so the instance that had it is gone. Whatever tab it opened points
       // here, so its sign-in can still complete against this process.

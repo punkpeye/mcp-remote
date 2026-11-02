@@ -51,6 +51,7 @@ async function runClient(
   authTimeoutMs: number,
   serverUrlHash: string,
   authSuccessUrl?: string,
+  bindHost?: string,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -68,6 +69,7 @@ async function runClient(
     authTimeoutMs,
     strictPort,
     authSuccessUrl,
+    bindHost,
   )
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
@@ -236,6 +238,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
       authTimeoutMs,
       serverUrlHash,
       authSuccessUrl,
+      bindHost,
     }) => {
       return runClient(
         serverUrl,
@@ -258,6 +261,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
         authTimeoutMs,
         serverUrlHash,
         authSuccessUrl,
+        bindHost,
       )
     },
   )

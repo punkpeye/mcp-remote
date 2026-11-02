@@ -63,6 +63,7 @@ async function runProxy(
   keepAlive: KeepAliveConfig,
   protocolMode: ProtocolMode,
   authSuccessUrl?: string,
+  bindHost?: string,
 ) {
   // Set up event emitter for auth flow
   const events = new EventEmitter()
@@ -80,6 +81,7 @@ async function runProxy(
     authTimeoutMs,
     strictPort,
     authSuccessUrl,
+    bindHost,
   )
 
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
@@ -321,6 +323,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
       keepAlive,
       protocolMode,
       authSuccessUrl,
+      bindHost,
     }) => {
       return runProxy(
         serverUrl,
@@ -346,6 +349,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
         keepAlive,
         protocolMode,
         authSuccessUrl,
+        bindHost,
       )
     },
   )
