@@ -212,7 +212,7 @@ Some authorization servers reject the resource parameter outright — Microsoft 
       ]
 ```
 
-* To change the address the OAuth callback server listens on (by default `127.0.0.1`), add the `--bind-host` flag. This is needed when running `mcp-remote` in a container, where the callback port is published to the host and the server has to listen on all interfaces to receive the browser's redirect. `--host` still sets the hostname in the registered callback URL, so it can stay `localhost` while the server binds to `0.0.0.0`. Binding beyond loopback lets anything that can reach the port deliver an authorization code, so only do this where the port is not otherwise exposed.
+* To change the address the OAuth callback server listens on (by default `127.0.0.1`), add the `--bind-host` flag. In a container, use `0.0.0.0` so the browser's redirect reaches the published callback port; `--host` still sets the host in the callback URL, so it can stay `localhost`. Anything that can reach the port can send it a callback, so publish it on the host's loopback only, e.g. `docker run -p 127.0.0.1:9696:9696 …`.
 
 ```json
       "args": [

@@ -2639,11 +2639,6 @@ const DEFAULT_CALLBACK_PATH = '/oauth/callback'
 export const MCP_REMOTE_ID_PATH = '/.mcp-remote/id'
 const LONG_POLL_PATH = '/wait-for-auth'
 
-/**
- * Builds the OAuth redirect URI for a given host/port. Kept in one place because the value
- * registered with the authorization server and the value checked against a cached
- * registration must match exactly - see invalidateMismatchedClientRegistration.
- */
 /** Loopback only by default: nothing off this machine should be able to hand us an authorization code. */
 export const DEFAULT_BIND_HOST = '127.0.0.1'
 
@@ -2652,6 +2647,11 @@ export function formatHostForUrl(address: string): string {
   return address.includes(':') && !address.startsWith('[') ? `[${address}]` : address
 }
 
+/**
+ * Builds the OAuth redirect URI for a given host/port. Kept in one place because the value
+ * registered with the authorization server and the value checked against a cached
+ * registration must match exactly - see invalidateMismatchedClientRegistration.
+ */
 export function buildRedirectUrl(host: string, port: number, callbackPath: string = DEFAULT_CALLBACK_PATH): string {
   return `http://${host}:${port}${callbackPath}`
 }
@@ -2973,7 +2973,8 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   let bindHost = DEFAULT_BIND_HOST
   const bindHostIndex = args.indexOf('--bind-host')
   if (bindHostIndex !== -1 && bindHostIndex < args.length - 1) {
-    bindHost = args[bindHostIndex + 1]
+    // `--host` takes an IPv6 literal in its URL form, [::1], but listen() only resolves it bare
+    bindHost = args[bindHostIndex + 1].replace(/^\[(.*)\]$/, '$1')
     log(`Binding the OAuth callback server to: ${bindHost}`)
   }
 

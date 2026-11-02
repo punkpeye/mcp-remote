@@ -595,6 +595,28 @@ describe('Feature: Command Line Arguments Parsing', () => {
     expect(result.transportStrategy).toBe('sse-only')
   })
 
+  it('Scenario: The callback server stays on loopback unless --bind-host says otherwise', async () => {
+    const result = await parseCommandLineArgs(['https://example.com/sse'], 'test usage')
+
+    expect(result.bindHost).toBe('127.0.0.1')
+  })
+
+  it('Scenario: --bind-host moves the listen address, not the host in the callback URL', async () => {
+    // In a container the server listens on every interface while the browser still uses localhost
+    const result = await parseCommandLineArgs(['https://example.com/sse', '9696', '--bind-host', '0.0.0.0'], 'test usage')
+
+    expect(result.bindHost).toBe('0.0.0.0')
+    expect(result.host).toBe(process.platform === 'win32' ? '127.0.0.1' : 'localhost')
+    expect(result.callbackPort).toBe(9696)
+  })
+
+  it('Scenario: An IPv6 --bind-host is accepted in the bracketed form --host takes', async () => {
+    // listen() cannot resolve [::1], and would only say so once a sign-in is under way
+    const result = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '[::1]'], 'test usage')
+
+    expect(result.bindHost).toBe('::1')
+  })
+
   it('Scenario: Return empty ignored tools array when none specified', async () => {
     // Given command line arguments without --ignore-tool flags
     const args = ['https://example.com/sse']
@@ -2638,6 +2660,15 @@ describe('Feature: MCP Proxy', () => {
   })
 })
 
+/** Whether this machine can listen on an address - some containers have no IPv6 loopback. */
+async function canBind(host: string): Promise<boolean> {
+  const probe = net.createServer()
+  return new Promise((resolve) => {
+    probe.once('error', () => resolve(false))
+    probe.listen(0, host, () => probe.close(() => resolve(true)))
+  })
+}
+
 describe('setupOAuthCallbackServerWithLongPoll', () => {
   let server: any
   let events: EventEmitter
@@ -2697,6 +2728,29 @@ describe('setupOAuthCallbackServerWithLongPoll', () => {
     const boundPort = (server.address() as net.AddressInfo).port
     expect(result.actualPort).toBe(boundPort)
     expect(result.actualPort).toBeGreaterThan(0)
+  })
+
+  it('listens on loopback only unless given a bind host', async () => {
+    // Anything that can reach the port can deliver a callback to it, so wider has to be asked for
+    const result = await setupOAuthCallbackServerWithLongPoll({ port: 0, path: '/oauth/callback', events, serverUrlHash: 'test-hash' })
+
+    server = result.server
+    expect((server.address() as net.AddressInfo).address).toBe('127.0.0.1')
+  })
+
+  it('listens on the bind host it is given', async (ctx) => {
+    // ::1 rather than 0.0.0.0: a wildcard bind sets off the macOS firewall prompt on every run
+    if (!(await canBind('::1'))) ctx.skip()
+    const result = await setupOAuthCallbackServerWithLongPoll({
+      port: 0,
+      path: '/oauth/callback',
+      events,
+      serverUrlHash: 'test-hash',
+      bindHost: '::1',
+    })
+
+    server = result.server
+    expect((server.address() as net.AddressInfo).address).toBe('::1')
   })
 
   it('surfaces EADDRINUSE instead of moving to a random port', async () => {
