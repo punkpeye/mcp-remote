@@ -201,7 +201,7 @@ Some authorization servers reject the resource parameter outright — Microsoft 
       ]
 ```
 
-* To change which host `mcp-remote` registers as the OAuth callback URL (by default `localhost`), add the `--host` flag.
+* To change which host `mcp-remote` registers as the OAuth callback URL (by default `localhost`), add the `--host` flag. An IPv6 address may be given with or without brackets; pair an IPv6 loopback address with `--bind-host ::1`, since the server listens on IPv4 loopback by default.
 
 ```json
       "args": [
@@ -212,7 +212,7 @@ Some authorization servers reject the resource parameter outright — Microsoft 
       ]
 ```
 
-* To change the address the OAuth callback server listens on (by default `127.0.0.1`), add the `--bind-host` flag. In a container, use `0.0.0.0` so the browser's redirect reaches the published callback port; `--host` still sets the host in the callback URL, so it can stay `localhost`. An empty value is ignored, so the server keeps listening on loopback. Anything that can reach the port can send it a callback, so publish it on the host's loopback only, e.g. `docker run -p 127.0.0.1:9696:9696 …`.
+* To change the address the OAuth callback server listens on (by default `127.0.0.1`), add the `--bind-host` flag. In a container, use `0.0.0.0` so the browser's redirect reaches the published callback port; `--host` still sets the host in the callback URL, so it can stay `localhost`. With `--bind-host ::1` the callback URL defaults to `[::1]` instead, because `127.0.0.1` does not reach a server listening only on IPv6 loopback, and `localhost` may resolve to it; pass `--host` to override that. An empty value is ignored, so the server keeps listening on loopback. Anything that can reach the port can send it a callback, so publish it on the host's loopback only, e.g. `docker run -p 127.0.0.1:9696:9696 …`.
 
 ```json
       "args": [

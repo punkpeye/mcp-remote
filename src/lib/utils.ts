@@ -2963,11 +2963,12 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
 
-  // Parse host
+  // Parse host. An IPv6 literal has to be bracketed in the redirect_uri, which is the form a URL
+  // authority requires; accepting it bare as well matches how the address is usually typed.
   let host = process.platform === 'win32' ? '127.0.0.1' : 'localhost' // Default
   const hostIndex = args.indexOf('--host')
   if (hostIndex !== -1 && hostIndex < args.length - 1) {
-    host = args[hostIndex + 1]
+    host = formatHostForUrl(args[hostIndex + 1])
     log(`Using callback hostname: ${host}`)
   }
 
@@ -2987,6 +2988,17 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
       bindHost = requestedBindHost
       log(`Binding the OAuth callback server to: ${bindHost}`)
     }
+  }
+
+  // The default `--host` names an address that resolves to loopback. 127.0.0.1 never reaches a
+  // listener bound only to ::1, and `localhost` only does if it resolves there, so `--bind-host ::1`
+  // with the host left alone could advertise a redirect_uri no browser can deliver a code to.
+  // Not `::`: Node binds it dual-stack, so the default host already reaches it, and in a container
+  // the browser has to reach a port published on the host, which may be IPv4 loopback only.
+  // `--host` still wins.
+  if (hostIndex === -1 && bindHost === '::1') {
+    host = '[::1]'
+    log(`Using callback hostname: ${host} (derived from --bind-host)`)
   }
 
   // Parse callback path. It has to be a path Express can route and that does not shadow the
