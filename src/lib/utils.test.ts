@@ -633,13 +633,13 @@ describe('Feature: Command Line Arguments Parsing', () => {
     expect(result.host).toBe('[::1]')
   })
 
-  it('Scenario: An IPv6 wildcard bind keeps the callback URL reachable on its loopback', async () => {
-    // :: includes ::1, so the same derivation works; localhost may resolve to 127.0.0.1, which a
-    // single-stack :: listener does not answer
+  it('Scenario: An IPv6 wildcard --bind-host keeps the default callback host', async () => {
+    // Node binds :: dual-stack, so the default host reaches it. In a container the browser reaches
+    // a port published on the host, e.g. -p 127.0.0.1:9696:9696, where [::1] would be refused.
     const result = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '::'], 'test usage')
 
     expect(result.bindHost).toBe('::')
-    expect(result.host).toBe('[::1]')
+    expect(result.host).toBe(process.platform === 'win32' ? '127.0.0.1' : 'localhost')
   })
 
   it('Scenario: An explicit --host still wins over an IPv6 --bind-host', async () => {

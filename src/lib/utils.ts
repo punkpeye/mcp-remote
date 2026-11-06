@@ -2990,10 +2990,13 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
 
-  // The default `--host` names an address that resolves to loopback. Neither that name nor
-  // 127.0.0.1 reaches an IPv6-only listener, so `--bind-host ::1` (or `::`) with the host left
-  // alone would advertise a redirect_uri no browser can deliver a code to. `--host` still wins.
-  if (hostIndex === -1 && (bindHost === '::1' || bindHost === '::')) {
+  // The default `--host` names an address that resolves to loopback. 127.0.0.1 never reaches a
+  // listener bound only to ::1, and `localhost` only does if it resolves there, so `--bind-host ::1`
+  // with the host left alone could advertise a redirect_uri no browser can deliver a code to.
+  // Not `::`: Node binds it dual-stack, so the default host already reaches it, and in a container
+  // the browser has to reach a port published on the host, which may be IPv4 loopback only.
+  // `--host` still wins.
+  if (hostIndex === -1 && bindHost === '::1') {
     host = '[::1]'
     log(`Using callback hostname: ${host} (derived from --bind-host)`)
   }
