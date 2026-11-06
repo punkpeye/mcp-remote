@@ -796,6 +796,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     const tokens = await readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema)
 
+    // A fresh process reads its tokens before the SDK asks for the client registration, but
+    // `requestedScope()` prefers the scope that registration was given. Without it the comparison
+    // below falls through to the authorization server's `scopes_supported`, which normally lists
+    // scopes this client never asked for, so a valid token would be deleted on every start (#389).
+    if (tokens && this._clientInfo === undefined) {
+      await this.clientInformation()
+    }
+
     if (tokens && this.scopeRequestChanged(tokens)) {
       log('The scopes this client asks for have changed since it signed in; signing in again')
       debugLog('Discarding a token obtained for a different scope request', {
