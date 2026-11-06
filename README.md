@@ -212,7 +212,7 @@ Some authorization servers reject the resource parameter outright — Microsoft 
       ]
 ```
 
-* To change the address the OAuth callback server listens on (by default `127.0.0.1`), add the `--bind-host` flag. In a container, use `0.0.0.0` so the browser's redirect reaches the published callback port; `--host` still sets the host in the callback URL, so it can stay `localhost`. An IPv6 listen address is different: with `--bind-host ::1` (or `::`) the callback URL defaults to `[::1]`, because `localhost` and `127.0.0.1` do not reach an IPv6-only listener. Pass `--host` to override that. Anything that can reach the port can send it a callback, so publish it on the host's loopback only, e.g. `docker run -p 127.0.0.1:9696:9696 …`.
+* To change the address the OAuth callback server listens on (by default `127.0.0.1`), add the `--bind-host` flag. In a container, use `0.0.0.0` so the browser's redirect reaches the published callback port; `--host` still sets the host in the callback URL, so it can stay `localhost`. An IPv6 listen address is different: with `--bind-host ::1` (or `::`) the callback URL defaults to `[::1]`, because `localhost` and `127.0.0.1` do not reach an IPv6-only listener. Pass `--host` to override that. An empty value is ignored, so the server keeps listening on loopback. Anything that can reach the port can send it a callback, so publish it on the host's loopback only, e.g. `docker run -p 127.0.0.1:9696:9696 …`.
 
 ```json
       "args": [

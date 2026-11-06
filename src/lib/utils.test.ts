@@ -669,6 +669,16 @@ describe('Feature: Command Line Arguments Parsing', () => {
     }
   })
 
+  it('Scenario: An empty --bind-host keeps the callback server on loopback', async () => {
+    // listen('') binds every interface, the opposite of the loopback default; whitespace is the
+    // same configuration mistake
+    const empty = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', ''], 'test usage')
+    const blank = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '   '], 'test usage')
+
+    expect(empty.bindHost).toBe('127.0.0.1')
+    expect(blank.bindHost).toBe('127.0.0.1')
+  })
+
   it('Scenario: Return empty ignored tools array when none specified', async () => {
     // Given command line arguments without --ignore-tool flags
     const args = ['https://example.com/sse']
@@ -2823,6 +2833,20 @@ describe('setupOAuthCallbackServerWithLongPoll', () => {
 
     expect(response.status).toBe(400)
     await expect(response.text()).resolves.toContain('No authorization code')
+  })
+
+  it('listens on loopback when given an empty bind host', async () => {
+    // A direct caller must not be able to turn the loopback default into a wildcard by passing ''
+    const result = await setupOAuthCallbackServerWithLongPoll({
+      port: 0,
+      path: '/oauth/callback',
+      events,
+      serverUrlHash: 'test-hash',
+      bindHost: '',
+    })
+
+    server = result.server
+    expect((server.address() as net.AddressInfo).address).toBe('127.0.0.1')
   })
 
   it('surfaces EADDRINUSE instead of moving to a random port', async () => {

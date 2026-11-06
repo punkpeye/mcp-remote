@@ -2584,8 +2584,12 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
   // what makes concurrent instances agree on an owner, and an instance that quietly moved
   // elsewhere would advertise a redirect_uri no browser can deliver a code to. EADDRINUSE is a
   // signal that somebody else owns this flow, and the caller decides what to do about it.
+  //
+  // An empty bind host is not a way to mean "default": listen('') binds every interface, which is
+  // the opposite of the loopback default. Keep the default for a caller that bypassed the parser.
+  const bindHost = options.bindHost?.trim() ? options.bindHost : DEFAULT_BIND_HOST
   const { server, actualPort } = await new Promise<{ server: Server; actualPort: number }>((resolve, reject) => {
-    const httpServer = app.listen(options.port, options.bindHost ?? DEFAULT_BIND_HOST)
+    const httpServer = app.listen(options.port, bindHost)
 
     httpServer.once('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {
@@ -2975,8 +2979,15 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   const bindHostIndex = args.indexOf('--bind-host')
   if (bindHostIndex !== -1 && bindHostIndex < args.length - 1) {
     // `--host` takes an IPv6 literal in its URL form, [::1], but listen() only resolves it bare
-    bindHost = args[bindHostIndex + 1].replace(/^\[(.*)\]$/, '$1')
-    log(`Binding the OAuth callback server to: ${bindHost}`)
+    const requestedBindHost = args[bindHostIndex + 1].replace(/^\[(.*)\]$/, '$1')
+    // An empty value must not reach listen(): listen('') binds every interface, the opposite of
+    // the loopback default. A value that is only whitespace is the same configuration mistake.
+    if (requestedBindHost.trim() === '') {
+      log('Warning: ignoring an empty --bind-host; the OAuth callback server stays on loopback')
+    } else {
+      bindHost = requestedBindHost
+      log(`Binding the OAuth callback server to: ${bindHost}`)
+    }
   }
 
   // The default `--host` names an address that resolves to loopback. Neither that name nor
