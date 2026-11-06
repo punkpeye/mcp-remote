@@ -729,6 +729,42 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(mockDeleteConfigFile).not.toHaveBeenCalled()
     })
 
+    it('keeps a token when the cached registration is what narrowed the scope (#389)', async () => {
+      // Given a server whose authorization metadata advertises more scopes than the client
+      // registered for, and a token obtained for the registered scope
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizationServerMetadata: {
+          issuer: 'https://auth.example.com',
+          scopes_supported: ['reader', 'writer', 'observability', 'offline_access'],
+        } as AuthorizationServerMetadata,
+      })
+      mockReadJsonFile.mockImplementation(async (_hash: string, name: string) => {
+        if (name === 'client_info.json') {
+          return {
+            client_id: 'test-client',
+            redirect_uris: ['http://localhost:8080/oauth/callback'],
+            scope: 'reader writer observability',
+          }
+        }
+        if (name === 'tokens.json') {
+          return {
+            access_token: 'at',
+            refresh_token: 'rt',
+            token_type: 'Bearer',
+            expires_in: 3600,
+            requested_scope: 'reader writer observability',
+          }
+        }
+        return undefined
+      })
+
+      // Then the first tokens() call of a fresh process keeps it. Comparing against the
+      // authorization server's wider list instead of the stored registration would delete it.
+      await expect(provider.tokens()).resolves.toMatchObject({ access_token: 'at' })
+      expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+    })
+
     it('leaves a token stored before this was recorded alone', async () => {
       // Nobody should be signed out by upgrading
       provider = new NodeOAuthClientProvider({ ...defaultOptions, staticOAuthClientMetadata: { scope: 'a.read' } as any })
