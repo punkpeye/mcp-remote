@@ -13,6 +13,7 @@ import {
   parseAuthorizeParams,
   fetchWithMcpHeaders,
   discoverOAuthServerInfo,
+  buildRedirectUrl,
 } from './utils'
 import { getConfigDir } from './mcp-auth-config'
 import { Headers as UndiciHeaders } from 'undici'
@@ -601,7 +602,7 @@ describe('Feature: Command Line Arguments Parsing', () => {
     expect(result.bindHost).toBe('127.0.0.1')
   })
 
-  it('Scenario: --bind-host moves the listen address, not the host in the callback URL', async () => {
+  it('Scenario: A wildcard --bind-host moves the listen address, not the host in the callback URL', async () => {
     // In a container the server listens on every interface while the browser still uses localhost
     const result = await parseCommandLineArgs(['https://example.com/sse', '9696', '--bind-host', '0.0.0.0'], 'test usage')
 
@@ -615,6 +616,57 @@ describe('Feature: Command Line Arguments Parsing', () => {
     const result = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '[::1]'], 'test usage')
 
     expect(result.bindHost).toBe('::1')
+  })
+
+  it('Scenario: An IPv6 --bind-host also moves the callback URL to IPv6 loopback', async () => {
+    // `localhost` and 127.0.0.1 do not reach a listener bound only to ::1, so the default host
+    // would advertise a redirect_uri the browser cannot deliver a code to
+    const result = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '::1'], 'test usage')
+
+    expect(result.bindHost).toBe('::1')
+    expect(result.host).toBe('[::1]')
+  })
+
+  it('Scenario: The bracketed IPv6 --bind-host moves the callback URL too', async () => {
+    const result = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '[::1]'], 'test usage')
+
+    expect(result.host).toBe('[::1]')
+  })
+
+  it('Scenario: An IPv6 wildcard bind keeps the callback URL reachable on its loopback', async () => {
+    // :: includes ::1, so the same derivation works; localhost may resolve to 127.0.0.1, which a
+    // single-stack :: listener does not answer
+    const result = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '::'], 'test usage')
+
+    expect(result.bindHost).toBe('::')
+    expect(result.host).toBe('[::1]')
+  })
+
+  it('Scenario: An explicit --host still wins over an IPv6 --bind-host', async () => {
+    const result = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '::1', '--host', 'localhost'], 'test usage')
+
+    expect(result.host).toBe('localhost')
+  })
+
+  it('Scenario: A bare IPv6 --host is bracketed for the callback URL', async () => {
+    // `--host ::1` without brackets would build an unparseable redirect_uri; --bind-host already
+    // accepts both forms, so --host should as well
+    const result = await parseCommandLineArgs(['https://example.com/sse', '--host', '::1'], 'test usage')
+
+    expect(result.host).toBe('[::1]')
+  })
+
+  it('Scenario: The Windows default host gives way to an IPv6 --bind-host', async () => {
+    const original = Object.getOwnPropertyDescriptor(process, 'platform')!
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+
+    try {
+      const result = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '::1'], 'test usage')
+
+      expect(result.host).toBe('[::1]')
+    } finally {
+      Object.defineProperty(process, 'platform', original)
+    }
   })
 
   it('Scenario: Return empty ignored tools array when none specified', async () => {
@@ -2751,6 +2803,26 @@ describe('setupOAuthCallbackServerWithLongPoll', () => {
 
     server = result.server
     expect((server.address() as net.AddressInfo).address).toBe('::1')
+  })
+
+  it('the callback URL derived from --bind-host ::1 reaches the server', async (ctx) => {
+    // The derivation only matters if the browser can deliver the code there, which is exactly what
+    // the default localhost/127.0.0.1 callback URL cannot do for an IPv6-only listener
+    if (!(await canBind('::1'))) ctx.skip()
+    const args = await parseCommandLineArgs(['https://example.com/sse', '--bind-host', '::1'], 'test usage')
+    const result = await setupOAuthCallbackServerWithLongPoll({
+      port: 0,
+      path: args.callbackPath,
+      events,
+      serverUrlHash: 'test-hash',
+      bindHost: args.bindHost,
+    })
+    server = result.server
+
+    const response = await fetch(buildRedirectUrl(args.host, result.actualPort, args.callbackPath))
+
+    expect(response.status).toBe(400)
+    await expect(response.text()).resolves.toContain('No authorization code')
   })
 
   it('surfaces EADDRINUSE instead of moving to a random port', async () => {

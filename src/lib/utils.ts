@@ -2959,11 +2959,12 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
 
-  // Parse host
+  // Parse host. An IPv6 literal has to be bracketed in the redirect_uri, which is the form a URL
+  // authority requires; accepting it bare as well matches how the address is usually typed.
   let host = process.platform === 'win32' ? '127.0.0.1' : 'localhost' // Default
   const hostIndex = args.indexOf('--host')
   if (hostIndex !== -1 && hostIndex < args.length - 1) {
-    host = args[hostIndex + 1]
+    host = formatHostForUrl(args[hostIndex + 1])
     log(`Using callback hostname: ${host}`)
   }
 
@@ -2976,6 +2977,14 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     // `--host` takes an IPv6 literal in its URL form, [::1], but listen() only resolves it bare
     bindHost = args[bindHostIndex + 1].replace(/^\[(.*)\]$/, '$1')
     log(`Binding the OAuth callback server to: ${bindHost}`)
+  }
+
+  // The default `--host` names an address that resolves to loopback. Neither that name nor
+  // 127.0.0.1 reaches an IPv6-only listener, so `--bind-host ::1` (or `::`) with the host left
+  // alone would advertise a redirect_uri no browser can deliver a code to. `--host` still wins.
+  if (hostIndex === -1 && (bindHost === '::1' || bindHost === '::')) {
+    host = '[::1]'
+    log(`Using callback hostname: ${host} (derived from --bind-host)`)
   }
 
   // Parse callback path. It has to be a path Express can route and that does not shadow the
