@@ -193,7 +193,13 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       ).resolves.toBe('REDIRECT')
 
       expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'client_info.json')
-      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      // Nothing is stored to discard here, but the SDK still asks for its refused tokens to go
+      expect(vi.mocked(mcpAuthConfig.deleteJsonFileIf)).toHaveBeenCalledWith(
+        'test-hash',
+        'tokens.json',
+        expect.anything(),
+        expect.any(Function),
+      )
       expect(requests.filter((request) => request === 'POST https://example.com/register')).toHaveLength(1)
       expect(requests.filter((request) => request.startsWith('GET https://example.com/authorize?'))).toHaveLength(1)
     })
@@ -664,6 +670,22 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
   })
 
   describe('a changed scope request', () => {
+    /**
+     * The token read for the old request is what goes - and only that one, not a token a sibling
+     * saved in its place after it was read.
+     */
+    const expectDiscarded = () => {
+      const call = vi.mocked(mcpAuthConfig.deleteJsonFileIf).mock.calls.find(([, file]) => file === 'tokens.json')
+      expect(call).toBeDefined()
+      const shouldDelete = call![3] as (stored: unknown) => boolean
+      expect(shouldDelete({ access_token: 'at', token_type: 'Bearer' })).toBe(true)
+      expect(shouldDelete({ access_token: 'saved-by-a-sibling', token_type: 'Bearer' })).toBe(false)
+    }
+    const expectNothingDiscarded = () => {
+      expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      expect(vi.mocked(mcpAuthConfig.deleteJsonFileIf)).not.toHaveBeenCalled()
+    }
+
     const storedWith = (requested_scope: string | undefined) => {
       mockReadJsonFile.mockResolvedValue({
         access_token: 'at',
@@ -681,7 +703,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
       // Then it is discarded, so the next flow asks for both
       await expect(provider.tokens()).resolves.toBeUndefined()
-      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      expectDiscarded()
     })
 
     it('keeps a token the server granted less scope than we asked for', async () => {
@@ -699,7 +721,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       // Then nothing is discarded. Signing in again would return the same narrower grant, so
       // treating it as a reason to retry is a loop with nothing to end it.
       await expect(provider.tokens()).resolves.toMatchObject({ access_token: 'at' })
-      expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      expectNothingDiscarded()
     })
 
     it('keeps the sign-in when nothing describes the scope to ask for', async () => {
@@ -707,7 +729,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       storedWith('openid profile offline_access')
 
       await expect(provider.tokens()).resolves.toMatchObject({ access_token: 'at' })
-      expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      expectNothingDiscarded()
     })
 
     it('signs in again when a server advertises the same scopes the fallback happens to name', async () => {
@@ -718,7 +740,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       storedWith('openid profile offline_access')
 
       await expect(provider.tokens()).resolves.toBeUndefined()
-      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      expectDiscarded()
     })
 
     it('reuses a token when the configuration has not changed', async () => {
@@ -726,7 +748,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       storedWith('a.read')
 
       await expect(provider.tokens()).resolves.toMatchObject({ access_token: 'at' })
-      expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      expectNothingDiscarded()
     })
 
     it('keeps a token when the cached registration is what narrowed the scope (#389)', async () => {
@@ -762,7 +784,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       // Then the first tokens() call of a fresh process keeps it. Comparing against the
       // authorization server's wider list instead of the stored registration would delete it.
       await expect(provider.tokens()).resolves.toMatchObject({ access_token: 'at' })
-      expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      expectNothingDiscarded()
     })
 
     it('leaves a token stored before this was recorded alone', async () => {
@@ -771,7 +793,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       storedWith(undefined)
 
       await expect(provider.tokens()).resolves.toMatchObject({ access_token: 'at' })
-      expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+      expectNothingDiscarded()
     })
   })
 
@@ -858,8 +880,83 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
 
       await provider.invalidateCredentials('tokens')
 
-      expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
+      expect(vi.mocked(mcpAuthConfig.deleteJsonFileIf)).toHaveBeenCalledWith(
+        'test-hash',
+        'tokens.json',
+        expect.anything(),
+        expect.any(Function),
+      )
       expect(mockDeleteConfigFile).not.toHaveBeenCalledWith('test-hash', 'client_info.json')
+    })
+  })
+
+  /**
+   * The store is shared, so by the time an instance is asked to discard "the refused token", the
+   * file may hold the fresh one a sibling saved after redeeming the same refresh token first
+   * (issues #389, #380). Only a token this instance has seen refused is the one meant.
+   */
+  describe('Feature: Discarding only the token that was refused', () => {
+    const stored = (overrides: Record<string, unknown> = {}) => ({
+      access_token: 'at-1',
+      refresh_token: 'rt-1',
+      token_type: 'Bearer',
+      ...overrides,
+    })
+    const json = (status: number, body: unknown) =>
+      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    const refreshGrant = (refreshToken: string): RequestInit => ({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+    })
+
+    /** Asks the predicate the provider handed the store whether it would delete this content. */
+    const discards = async (content: unknown) => {
+      await provider.invalidateCredentials('tokens')
+      const call = vi.mocked(mcpAuthConfig.deleteJsonFileIf).mock.calls.at(-1)!
+      return (call[3] as (stored: unknown) => boolean)(content)
+    }
+
+    beforeEach(() => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      vi.mocked(mcpAuthConfig.acquireConfigLease).mockResolvedValue('lease-1')
+    })
+
+    it('Scenario: A token whose refresh token the authorization server refused is discarded', async () => {
+      mockReadJsonFile.mockResolvedValue(stored())
+      const fetchFn = provider.coordinateTokenRequests(async () => json(400, { error: 'invalid_grant' }))
+
+      await fetchFn('https://auth.example.com/token', refreshGrant('rt-1'))
+
+      expect(await discards(stored())).toBe(true)
+      // A sibling's replacement carries another refresh token, and is not what was refused
+      expect(await discards(stored({ access_token: 'at-2', refresh_token: 'rt-2' }))).toBe(false)
+    })
+
+    it('Scenario: A token the MCP server answered with 401 is discarded', async () => {
+      const fetchFn = provider.coordinateTokenRequests(async () => new Response('Unauthorized', { status: 401 }))
+
+      await fetchFn('https://example.com/mcp', { method: 'POST', headers: { Authorization: 'Bearer at-1' }, body: '{}' })
+
+      expect(await discards(stored())).toBe(true)
+      expect(await discards(stored({ access_token: 'at-2', refresh_token: 'rt-2' }))).toBe(false)
+    })
+
+    it('Scenario: A token never seen refused is kept', async () => {
+      expect(await discards(stored())).toBe(false)
+    })
+
+    it('Scenario: A token file that cannot be read is discarded', async () => {
+      expect(await discards(undefined)).toBe(true)
+    })
+
+    it('Scenario: A server error says nothing about the refresh token', async () => {
+      mockReadJsonFile.mockResolvedValue(stored())
+      const fetchFn = provider.coordinateTokenRequests(async () => json(503, { error: 'temporarily_unavailable' }))
+
+      await fetchFn('https://auth.example.com/token', refreshGrant('rt-1'))
+
+      expect(await discards(stored())).toBe(false)
     })
   })
 
@@ -1314,6 +1411,146 @@ describe('NodeOAuthClientProvider - RFC 8707 resource indicator', () => {
     // The SDK sets `resource` from validateResourceURL before we ever see the URL, so the
     // provider must not touch it - that post-hoc rewrite was the source of the mismatch.
     expect(authUrl.searchParams.has('resource')).toBe(false)
+  })
+})
+
+/**
+ * After a 401 the SDK redeems the refresh token itself, through the transport's fetch. Unleased,
+ * instances that meet the 401 together each spend the same refresh token (issues #389, #380).
+ */
+describe("NodeOAuthClientProvider - the SDK's refresh, held to the refresh lease", () => {
+  const options: OAuthProviderOptions = {
+    serverUrl: 'https://example.com/mcp',
+    callbackPort: 8080,
+    host: 'localhost',
+    serverUrlHash: 'test-hash',
+  }
+  const tokenEndpoint = 'https://auth.example.com/token'
+  const tokens = (overrides: Record<string, unknown> = {}) => ({
+    access_token: 'at-1',
+    refresh_token: 'rt-1',
+    token_type: 'Bearer',
+    expires_in: 3600,
+    expires_at: Date.now() + 3_600_000,
+    ...overrides,
+  })
+  const json = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+  const refreshGrant = (refreshToken: string): RequestInit => ({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+  })
+  const refusedWith401 = { method: 'POST', headers: { Authorization: 'Bearer at-1', 'Content-Type': 'application/json' }, body: '{}' }
+
+  /** Successive reads of tokens.json; the last one keeps being read. */
+  let store: unknown[]
+  let tokenEndpointFetch: any
+  let provider: NodeOAuthClientProvider
+
+  beforeEach(() => {
+    store = [tokens()]
+    vi.mocked(mcpAuthConfig.readJsonFile)
+      .mockReset()
+      .mockImplementation(async (_hash: string, file: string) =>
+        file !== 'tokens.json' ? undefined : store.length > 1 ? store.shift() : store[0],
+      )
+    vi.mocked(mcpAuthConfig.writeJsonFile).mockReset().mockResolvedValue(undefined)
+    vi.mocked(mcpAuthConfig.acquireConfigLease).mockReset().mockResolvedValue('lease-1')
+    vi.mocked(mcpAuthConfig.readConfigLease).mockReset().mockResolvedValue(undefined)
+    vi.mocked(mcpAuthConfig.releaseConfigLease).mockReset().mockResolvedValue(undefined)
+    tokenEndpointFetch = vi.fn(async () =>
+      json(200, { access_token: 'at-2', refresh_token: 'rt-2', token_type: 'Bearer', expires_in: 3600 }),
+    )
+    provider = new NodeOAuthClientProvider(options)
+  })
+
+  afterEach(() => {
+    vi.mocked(mcpAuthConfig.acquireConfigLease).mockReset()
+    vi.mocked(mcpAuthConfig.readConfigLease).mockReset()
+    vi.clearAllMocks()
+  })
+
+  it('Scenario: The refresh goes out under the lease, and its result is saved before the lease is let go', async () => {
+    const response = await provider.coordinateTokenRequests(tokenEndpointFetch)(tokenEndpoint, refreshGrant('rt-1'))
+
+    expect(tokenEndpointFetch).toHaveBeenCalledTimes(1)
+    await expect(response.json()).resolves.toMatchObject({ access_token: 'at-2' })
+    // Saved by the time the next instance in line gets the lease, so it does not redeem rt-1 again
+    const write = vi.mocked(mcpAuthConfig.writeJsonFile)
+    expect(write).toHaveBeenCalledWith('test-hash', 'tokens.json', expect.objectContaining({ access_token: 'at-2', refresh_token: 'rt-2' }))
+    expect(write.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(mcpAuthConfig.releaseConfigLease).mock.invocationCallOrder[0])
+  })
+
+  it('Scenario: An instance that waited answers with the token its sibling saved, without redeeming again', async () => {
+    store = [tokens(), tokens({ access_token: 'at-2', refresh_token: 'rt-2' })]
+    vi.mocked(mcpAuthConfig.acquireConfigLease).mockResolvedValue(undefined)
+    vi.mocked(mcpAuthConfig.readConfigLease).mockResolvedValue({ pid: 4242, nonce: 'theirs', at: Date.now(), live: true })
+
+    const response = await provider.coordinateTokenRequests(tokenEndpointFetch)(tokenEndpoint, refreshGrant('rt-1'))
+
+    expect(tokenEndpointFetch).not.toHaveBeenCalled()
+    const answer = await response.json()
+    expect(answer).toMatchObject({ access_token: 'at-2', refresh_token: 'rt-2' })
+    // The store keeps the expiry absolute; a token response carries what is left of it
+    expect(answer.expires_in).toBeGreaterThan(3500)
+  })
+
+  it('Scenario: A 401 on an older token is answered with the newer one already on disk', async () => {
+    // Given a request refused with at-1, and a sibling that has saved at-2 since
+    store = [tokens({ access_token: 'at-2', refresh_token: 'rt-2' })]
+    const fetchFn = provider.coordinateTokenRequests(async (url, init) =>
+      String(url) === tokenEndpoint ? tokenEndpointFetch(url, init) : new Response('Unauthorized', { status: 401 }),
+    )
+    await fetchFn('https://example.com/mcp', refusedWith401)
+
+    // When the SDK refreshes what tokens() hands it now
+    const response = await fetchFn(tokenEndpoint, refreshGrant('rt-2'))
+
+    // Then at-2 is tried before anything rotates it away
+    expect(tokenEndpointFetch).not.toHaveBeenCalled()
+    await expect(response.json()).resolves.toMatchObject({ access_token: 'at-2' })
+  })
+
+  it('Scenario: A token the MCP server refused is redeemed, not handed back', async () => {
+    const fetchFn = provider.coordinateTokenRequests(async (url, init) =>
+      String(url) === tokenEndpoint ? tokenEndpointFetch(url, init) : new Response('Unauthorized', { status: 401 }),
+    )
+    await fetchFn('https://example.com/mcp', refusedWith401)
+
+    const response = await fetchFn(tokenEndpoint, refreshGrant('rt-1'))
+
+    expect(tokenEndpointFetch).toHaveBeenCalledTimes(1)
+    await expect(response.json()).resolves.toMatchObject({ access_token: 'at-2' })
+  })
+
+  it('Scenario: The refresh token redeemed is the one on disk, not one already replaced', async () => {
+    // A sibling rotated, but its token has already expired too - no answer, and rt-1 is spent
+    store = [tokens(), tokens({ access_token: 'at-x', refresh_token: 'rt-rotated', expires_at: Date.now() - 1000 })]
+
+    await provider.coordinateTokenRequests(tokenEndpointFetch)(tokenEndpoint, refreshGrant('rt-1'))
+
+    const [, sent] = tokenEndpointFetch.mock.calls[0]
+    expect(new URLSearchParams(sent.body).get('refresh_token')).toBe('rt-rotated')
+  })
+
+  it('Scenario: An MCP message goes through untouched, whatever its text says', async () => {
+    const inner = vi.fn(async () => json(200, {}))
+    const init = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { arguments: { q: 'grant_type=refresh_token&refresh_token=rt-1' } },
+      }),
+    }
+
+    await provider.coordinateTokenRequests(inner as any)('https://example.com/mcp', init)
+
+    expect(inner).toHaveBeenCalledWith('https://example.com/mcp', init)
+    expect(vi.mocked(mcpAuthConfig.acquireConfigLease)).not.toHaveBeenCalled()
   })
 })
 

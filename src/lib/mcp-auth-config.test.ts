@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'fs/promises'
+import fsSync from 'fs'
 import os from 'os'
 import path from 'path'
 import {
@@ -10,6 +11,7 @@ import {
   acquireConfigLease,
   readConfigLease,
   releaseConfigLease,
+  deleteJsonFileIf,
 } from './mcp-auth-config'
 
 vi.mock('./utils', () => ({
@@ -220,5 +222,64 @@ describe('Feature: Leasing a filename to one instance at a time', () => {
 
     const mode = (await fs.stat(getConfigFilePath(hash, filename))).mode & 0o777
     expect(mode).toBe(0o600)
+  })
+})
+
+describe('Feature: Deleting a file only while it holds what was checked', () => {
+  const hash = 'delete-if-hash'
+  const filename = 'tokens.json'
+  const schema = { parse: (value: unknown) => value as { access_token: string } }
+  const stored = async () => JSON.parse(await fs.readFile(getConfigFilePath(hash, filename), 'utf-8'))
+  const leftovers = async () => (await fs.readdir(getConfigDir())).filter((entry) => entry.endsWith('.discard'))
+
+  it('Scenario: The content the caller means is deleted', async () => {
+    await writeJsonFile(hash, filename, { access_token: 'refused' })
+
+    await expect(deleteJsonFileIf(hash, filename, schema, (content) => content?.access_token === 'refused')).resolves.toBe(true)
+
+    await expect(fs.access(getConfigFilePath(hash, filename))).rejects.toThrow(/ENOENT/)
+    expect(await leftovers()).toEqual([])
+  })
+
+  it('Scenario: Content the caller does not mean is left alone', async () => {
+    await writeJsonFile(hash, filename, { access_token: 'fresh' })
+
+    await expect(deleteJsonFileIf(hash, filename, schema, (content) => content?.access_token === 'refused')).resolves.toBe(false)
+
+    expect(await stored()).toEqual({ access_token: 'fresh' })
+  })
+
+  it('Scenario: A missing file is nothing to delete', async () => {
+    const shouldDelete = vi.fn(() => true)
+
+    await expect(deleteJsonFileIf(hash, filename, schema, shouldDelete)).resolves.toBe(false)
+
+    expect(shouldDelete).not.toHaveBeenCalled()
+  })
+
+  it('Scenario: A file that does not parse is offered as undefined', async () => {
+    await fs.mkdir(getConfigDir(), { recursive: true })
+    await fs.writeFile(getConfigFilePath(hash, filename), '{ torn')
+
+    await expect(deleteJsonFileIf(hash, filename, schema, (content) => content === undefined)).resolves.toBe(true)
+  })
+
+  it('Scenario: A file a sibling replaced after the check survives the delete', async () => {
+    await writeJsonFile(hash, filename, { access_token: 'refused' })
+
+    // The sibling lands its write between the check and the delete, the way writeJsonFile does it
+    const deleted = await deleteJsonFileIf(hash, filename, schema, (content) => {
+      if (content?.access_token === 'refused') {
+        const temp = `${getConfigFilePath(hash, filename)}.sibling.tmp`
+        fsSync.writeFileSync(temp, JSON.stringify({ access_token: 'fresh' }))
+        fsSync.renameSync(temp, getConfigFilePath(hash, filename))
+        return true
+      }
+      return false
+    })
+
+    expect(deleted).toBe(false)
+    expect(await stored()).toEqual({ access_token: 'fresh' })
+    expect(await leftovers()).toEqual([])
   })
 })

@@ -199,6 +199,24 @@ describe('connectToRemoteServer', () => {
     expect(mockState.finishAuthCalls).toHaveLength(1)
   })
 
+  it('sends through the fetch the auth provider coordinates its token requests with (#389)', async () => {
+    // The SDK redeems refresh tokens through the transport's fetch after a 401, so that is the fetch
+    // the provider has to hold to its refresh lease
+    const coordinated = vi.fn()
+    const coordinateTokenRequests = vi.fn(() => coordinated)
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async () => ({ code: 'auth-code-123' }),
+      skipBrowserAuth: false,
+    })
+
+    await connectToRemoteServer(null, 'https://mcp.example.com/mcp', { coordinateTokenRequests } as any, {}, authInitializer, 'http-first')
+
+    expect(mockState.httpTransports.length).toBeGreaterThanOrEqual(2)
+    for (const transport of mockState.httpTransports) {
+      expect((transport as unknown as { opts: { fetch: unknown } }).opts.fetch).toBe(coordinated)
+    }
+  })
+
   it('discards a token the server refused after issuing it, then signs in again', async () => {
     // Given a server that refuses the cached token even though the SDK just authorized with it,
     // and takes the next one. Nothing else clears that credential, so without this the same

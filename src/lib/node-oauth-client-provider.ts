@@ -15,6 +15,7 @@ import {
   selectResourceURL,
 } from '@modelcontextprotocol/client'
 import type {
+  FetchLike,
   OAuthClientInformation,
   OAuthClientInformationContext,
   OAuthClientInformationFull,
@@ -30,6 +31,7 @@ import {
   readTextFile,
   writeTextFile,
   deleteConfigFile,
+  deleteJsonFileIf,
   deleteStaleConfigFiles,
   acquireConfigLease,
   readConfigLease,
@@ -160,6 +162,29 @@ const DISCOVERY_STATE_PREFIX = 'discovery_state_'
 const REFRESH_LEASE_MS = 30_000
 const REFRESH_POLL_MS = 200
 
+/**
+ * How long the SDK's refresh waits for the refresh lease before going ahead without it.
+ *
+ * Twice {@link REFRESH_LEASE_MS}: an owner that is alive but stuck loses the lease after one, and
+ * a queue of instances each taking a turn needs some of the other. Running out means the lease
+ * cannot be had at all - a lease path that cannot be cleared, say - and a refresh that never goes
+ * out would fail every request instead.
+ */
+const REFRESH_LEASE_WAIT_MS = 2 * REFRESH_LEASE_MS
+
+/**
+ * The token endpoint's answers after which the refresh token it was sent is dead for good, and the
+ * token carrying it is what a request to discard the tokens means. See `discardRefusedTokens`.
+ */
+const REFUSING_ERRORS: ReadonlySet<string> = new Set([
+  OAuthErrorCode.InvalidGrant,
+  OAuthErrorCode.InvalidClient,
+  OAuthErrorCode.UnauthorizedClient,
+])
+
+/** How many refused credentials an instance remembers. A handful are refused in a whole run. */
+const REFUSALS_REMEMBERED = 16
+
 /** Stands in for a lease when the store cannot be written at all. See {@link takeRefreshLease}. */
 const UNCOORDINATED = ''
 
@@ -236,10 +261,63 @@ function staleClientRegistrationError(value: unknown): OAuthError | undefined {
 }
 
 /**
+ * The form parameters of a token request, if that is what a request is: a form-encoded POST, as
+ * the SDK sends to the token endpoint. An MCP message is JSON, and never one.
+ */
+function tokenRequestParams(init: RequestInit | undefined): URLSearchParams | undefined {
+  if (init?.method?.toUpperCase() !== 'POST') return undefined
+  if (init.body instanceof URLSearchParams) return init.body
+  if (typeof init.body === 'string' && new Headers(init.headers).get('Content-Type')?.startsWith('application/x-www-form-urlencoded')) {
+    return new URLSearchParams(init.body)
+  }
+  return undefined
+}
+
+/** The refresh token a request redeems, if it is a `refresh_token` grant. */
+function refreshTokenRedeemedBy(init: RequestInit | undefined): string | undefined {
+  const params = tokenRequestParams(init)
+  return params?.get('grant_type') === 'refresh_token' ? (params.get('refresh_token') ?? undefined) : undefined
+}
+
+/** The same token request, redeeming the given refresh token instead. */
+function withRefreshToken(init: RequestInit | undefined, refreshToken: string): RequestInit | undefined {
+  const params = tokenRequestParams(init)
+  if (!params || params.get('refresh_token') === refreshToken) return init
+  const body = new URLSearchParams(params)
+  body.set('refresh_token', refreshToken)
+  return { ...init, body }
+}
+
+/**
+ * A token response carrying tokens that are already on disk, for a refresh another instance made.
+ *
+ * The SDK parses it like any other and saves what it holds, so it ends up with the token the store
+ * already has. Only the expiry needs translating back, from the absolute time the store keeps to
+ * the relative one a token response carries.
+ */
+function answerWithStoredTokens(stored: OAuthTokensWithExpiresAt): Response {
+  const expiresIn = stored.expires_at === undefined ? stored.expires_in : Math.max(1, Math.floor((stored.expires_at - Date.now()) / 1000))
+  const body = {
+    access_token: stored.access_token,
+    token_type: stored.token_type,
+    refresh_token: stored.refresh_token,
+    scope: stored.scope,
+    id_token: stored.id_token,
+    expires_in: expiresIn,
+  }
+  return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } })
+}
+
+/** What the transports ask of an auth provider that coordinates their token requests. */
+export interface TokenRequestCoordinator {
+  coordinateTokenRequests(fetchFn: FetchLike): FetchLike
+}
+
+/**
  * Implements the OAuthClientProvider interface for Node.js environments.
  * Handles OAuth flow and token storage for MCP clients.
  */
-export class NodeOAuthClientProvider implements OAuthClientProvider {
+export class NodeOAuthClientProvider implements OAuthClientProvider, TokenRequestCoordinator {
   private serverUrlHash: string
   private callbackPath: string
   private clientName: string
@@ -281,6 +359,13 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private recentAuthorizations: number[] = []
   /** In-flight proactive refresh, so concurrent requests share one refresh_token use */
   private refreshInFlight: Promise<OAuthTokensWithExpiresAt | undefined> | null = null
+  /**
+   * Refresh tokens the authorization server refused, and bearer credentials the MCP server answered
+   * with 401: what "the refused token" means when this instance is asked to discard it, rather than
+   * whatever the shared store happens to hold by then. See {@link discardRefusedTokens}.
+   */
+  private refusedRefreshTokens = new Set<string>()
+  private rejectedBearers = new Set<string>()
   /** Concurrent requests share one client_credentials renewal, which has no refresh token. */
   private clientCredentialsInFlight: Promise<void> | null = null
   /**
@@ -810,7 +895,13 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         obtainedFor: tokens.requested_scope,
         nowRequesting: this.getEffectiveScope(),
       })
-      await this.invalidateCredentials('tokens')
+      // This token, not whatever a sibling may have saved in its place since it was read
+      await deleteJsonFileIf(
+        this.serverUrlHash,
+        'tokens.json',
+        OAuthTokensWithExpiresAtSchema,
+        (stored) => stored === undefined || stored.access_token === tokens.access_token,
+      )
       return undefined
     }
 
@@ -1113,8 +1204,224 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         expires_at: refreshed.expires_in ? Date.now() + refreshed.expires_in * 1000 : undefined,
       })
     } catch (error) {
+      if (error instanceof OAuthError && REFUSING_ERRORS.has(error.code)) this.rememberRefusal(this.refusedRefreshTokens, refreshToken)
       debugLog('Proactive token refresh failed', error)
       return undefined
+    }
+  }
+
+  /**
+   * Wraps the fetch the transports send with, so the SDK's own refresh is held to one use per host
+   * as well.
+   *
+   * {@link tokens} renews a token about to expire under the refresh lease, but that is not the only
+   * redemption. A token the MCP server refuses before it expires - revoked, say, or after a sleep
+   * the clock did not notice - comes back as a 401, and the SDK's `auth()` answers that by redeeming
+   * the refresh token itself, outside any lease. Instances that meet the 401 together each spend
+   * the same refresh token. A server that rotates refuses all but the first with `invalid_grant`,
+   * and the SDK answers that by discarding the stored token - by then, the fresh one the first
+   * instance saved (issues #389, #380).
+   *
+   * The SDK sends that request through the transport's fetch, which is what this wraps. Anything
+   * other than a `refresh_token` grant passes straight through, noting on the way any bearer
+   * credential the MCP server answered with 401. See {@link discardRefusedTokens}.
+   *
+   * @param fetchFn The fetch to send requests with
+   * @returns The same fetch, with refresh token redemptions coordinated across the host
+   */
+  coordinateTokenRequests(fetchFn: FetchLike): FetchLike {
+    return async (url, init) => {
+      const refreshToken = refreshTokenRedeemedBy(init)
+      if (refreshToken !== undefined) return this.redeemForSdk(refreshToken, (sent) => fetchFn(url, withRefreshToken(init, sent)))
+
+      const response = await fetchFn(url, init)
+      if (response.status === 401) this.noteRejectedBearer(init)
+      return response
+    }
+  }
+
+  /**
+   * Sends the SDK's refresh only while holding the refresh lease, and not at all once another
+   * instance has redeemed the same refresh token.
+   *
+   * With the lease held the store is read again. A token there that already answers the refresh -
+   * typically one a sibling saved after redeeming the same refresh token first - is the answer:
+   * spending the old refresh token again earns `invalid_grant`, or under reuse detection (RFC 9700
+   * §4.14.2) costs the whole grant. See {@link alreadyAnswers}. Otherwise the request goes out,
+   * redeeming whatever refresh token is on disk now, and what it brings back is saved before the
+   * lease is let go, so the next instance in line finds it rather than redeeming the same token.
+   *
+   * @param requested The refresh token the SDK set out to redeem
+   * @param send Sends the request, redeeming the given refresh token
+   * @returns The token endpoint's response, or one carrying the token already on disk
+   */
+  private async redeemForSdk(requested: string, send: (refreshToken: string) => Promise<Response>): Promise<Response> {
+    const seen = (await this.readStoredTokens())?.access_token
+    const deadline = Date.now() + REFRESH_LEASE_WAIT_MS
+
+    let lease = await this.takeRefreshLease()
+    while (lease === undefined) {
+      const replacement = await this.awaitRedemptionBySibling(requested, seen)
+      if (replacement) {
+        debugLog('Another instance already redeemed this refresh token; answering with the token it saved')
+        return answerWithStoredTokens(replacement)
+      }
+      lease = await this.takeRefreshLease()
+      if (lease === undefined && Date.now() >= deadline) {
+        debugLog('Could not take the refresh lease in time; refreshing without coordinating')
+        lease = UNCOORDINATED
+      }
+    }
+
+    try {
+      const stored = await this.readStoredTokens()
+      if (stored && this.alreadyAnswers(stored, requested, seen)) {
+        debugLog('Another instance already redeemed this refresh token; answering with the token it saved')
+        return answerWithStoredTokens(stored)
+      }
+
+      const redeemed = stored?.refresh_token ?? requested
+      const response = await send(redeemed)
+      await this.recordRedemption(redeemed, response, stored)
+      return response
+    } finally {
+      if (lease !== UNCOORDINATED) await releaseConfigLease(this.serverUrlHash, REFRESH_LEASE_FILE, lease)
+    }
+  }
+
+  /**
+   * Waits on the instance holding the refresh lease, until it saves a replacement for the token the
+   * SDK set out to refresh or lets the lease go without one.
+   *
+   * @returns The replacement, or undefined once the lease is there to take - released, or abandoned by an owner that died or stalled
+   */
+  private async awaitRedemptionBySibling(requested: string, seen: string | undefined): Promise<OAuthTokensWithExpiresAt | undefined> {
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, REFRESH_POLL_MS))
+
+      const stored = await this.readStoredTokens()
+      if (stored && this.alreadyAnswers(stored, requested, seen)) return stored
+
+      const holder = await readConfigLease(this.serverUrlHash, REFRESH_LEASE_FILE, REFRESH_LEASE_MS)
+      if (!holder?.live) return undefined
+    }
+  }
+
+  /**
+   * Whether the stored token already answers the SDK's refresh, so redeeming would only rotate
+   * again.
+   *
+   * It does when it replaced the token the SDK set out to refresh - another refresh token, or from
+   * a server that does not rotate them, another access token than was on disk when the SDK asked.
+   * It also does when the SDK is reacting to a 401 on an older token: the SDK refreshes whatever
+   * `tokens()` hands it, and by the time it asks, that may already be the token a sibling, or this
+   * instance's own proactive refresh, saved in its place. Rotating again then gains nothing, and a
+   * server that revokes the previous access token on rotation would refuse every request already
+   * carrying the new one.
+   *
+   * A token known to be refused, or already expired, answers nothing.
+   *
+   * @param stored What the store holds now
+   * @param requested The refresh token the SDK set out to redeem
+   * @param seen The access token on disk when it did
+   */
+  private alreadyAnswers(stored: OAuthTokensWithExpiresAt, requested: string, seen: string | undefined): boolean {
+    const expiresAt = this.bearerExpiresAt(stored)
+    if (expiresAt !== undefined && Date.now() >= expiresAt) return false
+    if (this.wasRefused(stored)) return false
+    if (stored.refresh_token !== requested || stored.access_token !== seen) return true
+    return this.rejectedBearers.size > 0
+  }
+
+  /**
+   * Saves what the token endpoint issued while the lease is still held, or notes the refresh token
+   * it refused.
+   *
+   * The SDK saves the tokens too, but only once the response is back in its hands - after the lease
+   * is gone, when the next instance in line would already have redeemed the old refresh token
+   * again. A save that fails here is left to the SDK's: failing the response for it would turn a
+   * refresh that worked into a sign-in.
+   */
+  private async recordRedemption(redeemed: string, response: Response, stored: OAuthTokensWithExpiresAt | undefined): Promise<void> {
+    const body: unknown = await response
+      .clone()
+      .json()
+      .catch(() => undefined)
+
+    if (!response.ok) {
+      const error = (body as { error?: unknown } | undefined)?.error
+      if (typeof error === 'string' && REFUSING_ERRORS.has(error)) this.rememberRefusal(this.refusedRefreshTokens, redeemed)
+      return
+    }
+
+    const issued = OAuthTokensSchema.safeParse(body)
+    if (!issued.success) return
+    try {
+      await writeJsonFile(
+        this.serverUrlHash,
+        'tokens.json',
+        // A server that does not rotate leaves the refresh token out of its response
+        this.storedForm({ ...issued.data, refresh_token: issued.data.refresh_token ?? redeemed, issuer: stored?.issuer }),
+      )
+    } catch (error) {
+      debugLog('Could not save the refreshed token before releasing the lease', error)
+    }
+  }
+
+  /** Notes the bearer credential a 401 answered, so that token counts as refused. */
+  private noteRejectedBearer(init: RequestInit | undefined): void {
+    const bearer = new Headers(init?.headers).get('Authorization')?.match(/^Bearer\s+(\S+)/i)?.[1]
+    if (bearer) this.rememberRefusal(this.rejectedBearers, bearer)
+  }
+
+  private rememberRefusal(refusals: Set<string>, credential: string): void {
+    refusals.add(credential)
+    // A Set iterates in insertion order, so this drops the oldest
+    for (const oldest of refusals) {
+      if (refusals.size <= REFUSALS_REMEMBERED) break
+      refusals.delete(oldest)
+    }
+  }
+
+  /** Whether this instance has seen the token refused: its refresh token turned down, or its bearer answered with 401. */
+  private wasRefused(tokens: OAuthTokensWithExpiresAt): boolean {
+    return (
+      (tokens.refresh_token !== undefined && this.refusedRefreshTokens.has(tokens.refresh_token)) ||
+      this.rejectedBearers.has(tokens.access_token) ||
+      (tokens.id_token !== undefined && this.rejectedBearers.has(tokens.id_token))
+    )
+  }
+
+  /**
+   * Deletes the stored token if it is one this instance has seen refused, and only then.
+   *
+   * A request to invalidate the tokens means the token that was refused: the SDK asks after a
+   * refresh comes back `invalid_grant`, this package after the MCP server rejects a token it was
+   * just issued. But the store is shared, and by the time the request arrives it may hold another
+   * token - the one a sibling saved after redeeming the same refresh token first. Deleting by name
+   * threw that away and sent every instance to the browser (issues #389, #380). A file that cannot
+   * be read is no use to anyone, and goes either way.
+   */
+  private async discardRefusedTokens(): Promise<void> {
+    const deleted = await deleteJsonFileIf(
+      this.serverUrlHash,
+      'tokens.json',
+      OAuthTokensWithExpiresAtSchema,
+      (stored) => stored === undefined || this.wasRefused(stored),
+    )
+    debugLog(deleted ? 'OAuth tokens invalidated' : 'Kept the stored token, which is not the one that was refused')
+  }
+
+  private readStoredTokens(): Promise<OAuthTokensWithExpiresAt | undefined> {
+    return readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema)
+  }
+
+  /** The tokens as they are kept on disk: with an absolute expiry, and the scope request they answer. */
+  private storedForm(tokens: OAuthTokensWithExpiresAt): OAuthTokensWithExpiresAt {
+    return {
+      ...tokens,
+      expires_at: tokens.expires_at ?? (tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined),
+      requested_scope: this.getEffectiveScope(),
     }
   }
 
@@ -1221,13 +1528,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     // `expires_in` here declared a lapsed token good for another full lifetime, so on a 401 a
     // second instance judged it usable, skipped the shared sign-in and retried the dead
     // credential: one failed request and an extra browser tab per instance.
-    const tokensToSave: OAuthTokensWithExpiresAt = {
-      ...tokens,
-      expires_at: tokens.expires_at ?? (tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined),
-      requested_scope: this.getEffectiveScope(),
-    }
-
-    await writeJsonFile(this.serverUrlHash, 'tokens.json', tokensToSave)
+    await writeJsonFile(this.serverUrlHash, 'tokens.json', this.storedForm(tokens))
 
     // The flow is over, and its verifier and discovery are named after a state nothing will use again
     await deleteConfigFile(this.serverUrlHash, this.codeVerifierFile(this.flowState))
@@ -1598,8 +1899,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         break
 
       case 'tokens':
-        await deleteConfigFile(this.serverUrlHash, 'tokens.json')
-        debugLog('OAuth tokens invalidated')
+        await this.discardRefusedTokens()
         break
 
       case 'verifier':

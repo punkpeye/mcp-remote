@@ -95,6 +95,90 @@ export async function deleteConfigFile(serverUrlHash: string, filename: string):
 }
 
 /**
+ * Deletes a JSON config file, but only if what it holds is what the caller means to delete.
+ *
+ * Instances sharing a store replace each other's files, so the file read a moment ago may not be
+ * the one on disk now. The case this exists for is a token refused for one instance while a sibling
+ * saves the fresh one that replaced it (issue #389): deleting by name after checking the content
+ * would remove the fresh token and send every instance back to the browser.
+ *
+ * So the file is renamed aside first, which takes exactly one version out of the next writer's
+ * way, and only that version is judged and deleted. One that turns out to be newer goes back,
+ * unless an even newer one has been written in its place meanwhile. Writers replace the file by
+ * rename as well (see {@link writeJsonFile}), so nothing is deleted that was not checked.
+ *
+ * @param serverUrlHash The hash of the server URL
+ * @param filename The name of the file
+ * @param schema The schema the content is parsed with
+ * @param shouldDelete Whether the content is what should go - undefined if it does not parse
+ * @returns Whether the file was deleted
+ */
+export async function deleteJsonFileIf<T>(
+  serverUrlHash: string,
+  filename: string,
+  schema: { parse(value: unknown): T },
+  shouldDelete: (content: T | undefined) => boolean,
+): Promise<boolean> {
+  const filePath = getConfigFilePath(serverUrlHash, filename)
+  const judge = (raw: string) => {
+    let content: T | undefined
+    try {
+      content = schema.parse(JSON.parse(raw))
+    } catch {
+      content = undefined
+    }
+    return shouldDelete(content)
+  }
+
+  let checked: string
+  try {
+    checked = await fs.readFile(filePath, 'utf-8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') log(`Error reading ${filename}:`, error)
+    return false
+  }
+  if (!judge(checked)) return false
+
+  const aside = `${filePath}.${process.pid}.${randomUUID()}.discard`
+  try {
+    await fs.rename(filePath, aside)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    // Windows refuses to rename a file another process has open. Deleting it by name is what
+    // happened before this check existed, and still beats keeping a credential known to be bad.
+    debugLog(`Could not set ${filename} aside; deleting it in place`, error)
+    await deleteConfigFile(serverUrlHash, filename)
+    return true
+  }
+
+  try {
+    // A version that cannot be read back cannot be checked either, so it goes back like a newer one
+    const setAside = await fs.readFile(aside, 'utf-8').catch(() => undefined)
+    if (setAside !== undefined && (setAside === checked || judge(setAside))) return true
+
+    debugLog(`Kept ${filename}, which changed after it was checked`)
+    await restoreConfigFile(aside, filePath)
+    return false
+  } finally {
+    await fs.unlink(aside).catch(() => {})
+  }
+}
+
+/** Puts a file that was set aside back under its name, without overwriting one written there since. */
+async function restoreConfigFile(aside: string, filePath: string): Promise<void> {
+  try {
+    // A hard link appears whole or not at all, and fails rather than replace a newer file
+    await fs.link(aside, filePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return
+    // A filesystem without hard links: copy instead, still refusing to overwrite
+    await fs.copyFile(aside, filePath, fs.constants.COPYFILE_EXCL).catch((copyError: NodeJS.ErrnoException) => {
+      if (copyError.code !== 'EEXIST') log(`Error restoring ${path.basename(filePath)}:`, copyError)
+    })
+  }
+}
+
+/**
  * Removes this server's config files with the given prefix that are older than maxAgeMs
  *
  * A filename carrying a one-off identifier is never written again, so abandoned ones would stay
@@ -174,7 +258,9 @@ export async function writeJsonFile(serverUrlHash: string, filename: string, dat
     // directory, and a torn read of tokens.json surfaces as a parse failure that
     // looks like corrupted credentials.
     const serialized = JSON.stringify(data, null, 2)
-    const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`
+    // Unique per write, not per millisecond: two writes from one process can land in the same one,
+    // and the second would then rename a temp file the first had already moved
+    const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`
 
     try {
       await fs.writeFile(tempPath, serialized, { encoding: 'utf-8', mode: 0o600 })

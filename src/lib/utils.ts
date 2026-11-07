@@ -10,6 +10,7 @@ import {
   UnauthorizedError,
 } from '@modelcontextprotocol/client'
 import type { FetchLike, OAuthClientInformationFull, Transport } from '@modelcontextprotocol/client'
+import type { TokenRequestCoordinator } from './node-oauth-client-provider'
 import {
   canFulfilInputRequest,
   discoverRequest,
@@ -178,6 +179,15 @@ export const fetchWithMcpHeaders = (async (url: string | URL, init?: RequestInit
   captureCookies(url, response)
   return response.ok ? response : asGlobalResponse(response)
 }) as unknown as FetchLike
+
+/**
+ * A fetch for the transports, routed through the auth provider's coordination of token requests
+ * when it has one. See `NodeOAuthClientProvider.coordinateTokenRequests`.
+ */
+function coordinatedFetch(authProvider: OAuthClientProvider | undefined, fetchFn: FetchLike): FetchLike {
+  const coordinator = authProvider as Partial<TokenRequestCoordinator> | undefined
+  return typeof coordinator?.coordinateTokenRequests === 'function' ? coordinator.coordinateTokenRequests(fetchFn) : fetchFn
+}
 
 /** Statuses the `Response` constructor refuses a body for, per the fetch spec's null body statuses. */
 const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304])
@@ -2104,6 +2114,13 @@ export async function connectToRemoteServer(
   log(`[${pid}] Connecting to remote server: ${serverUrl}`)
   const url = new URL(serverUrl)
 
+  // The SDK redeems refresh tokens through the transport's fetch too, after a 401, and the provider
+  // holds those to one use per host - see `coordinateTokenRequests`. The event stream's fetch goes
+  // the same way, so a 401 on the stream counts as a refused token like any other.
+  const transportFetch = coordinatedFetch(authProvider, fetchWithMcpHeaders)
+  // The casts bridge types only, as for `fetchWithMcpHeaders`
+  const eventStreamFetch = coordinatedFetch(authProvider, fetch as unknown as FetchLike) as unknown as typeof fetch
+
   // Every attempt the EventSource makes to open the stream comes through the `fetch` below,
   // including the ones it makes on its own after the connection drops. Counting them is how a
   // reconnect becomes observable from out here: the SDK exposes no event for it.
@@ -2115,7 +2132,7 @@ export async function connectToRemoteServer(
       return Promise.resolve(authProvider?.tokens?.())
         .then((tokens) => {
           const cookie = cookieHeaderFor(requestUrl)
-          return fetch(requestUrl, {
+          return eventStreamFetch(requestUrl, {
             ...init,
             headers: mergeHeaders(
               init?.headers,
@@ -2155,12 +2172,12 @@ export async function connectToRemoteServer(
         authProvider,
         requestInit: { headers },
         eventSourceInit,
-        fetch: fetchWithMcpHeaders,
+        fetch: transportFetch,
       })
     : new StreamableHTTPClientTransport(url, {
         authProvider,
         requestInit: { headers },
-        fetch: fetchWithMcpHeaders,
+        fetch: transportFetch,
       })
 
   // When connecting without a Client (proxy mode), the auth challenge (401) is not received by
@@ -2194,7 +2211,7 @@ export async function connectToRemoteServer(
         const testTransport = new StreamableHTTPClientTransport(url, {
           authProvider,
           requestInit: { headers },
-          fetch: fetchWithMcpHeaders,
+          fetch: transportFetch,
         })
         // This transport is the one that will receive (and store the metadata from) any 401 challenge.
         authChallengeTransport = testTransport
