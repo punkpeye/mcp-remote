@@ -195,4 +195,43 @@ describe('Feature: Asking whether the server wants a sign-in', () => {
   it('Scenario: A server we cannot reach is left to the 401 handler', async () => {
     await expect(serverIssuesAuthChallenge('http://127.0.0.1:9/mcp')).resolves.toBe(false)
   })
+
+  /** A server answering however `respond` decides, and a record of the headers that reached it. */
+  async function recording(respond: (req: http.IncomingMessage, res: http.ServerResponse) => void) {
+    const reached: http.IncomingHttpHeaders[] = []
+    const server = http.createServer((req, res) => {
+      reached.push(req.headers)
+      respond(req, res)
+    })
+    const port = await new Promise<number>((r) => server.listen(0, '127.0.0.1', () => r((server.address() as net.AddressInfo).port)))
+    opened.push({ close: () => new Promise((r) => (server.closeAllConnections(), server.close(() => r()))) })
+    return { url: `http://127.0.0.1:${port}/mcp`, reached }
+  }
+
+  it("Scenario: A probe redirected to another origin does not take the user's headers there", async () => {
+    // Given somewhere else that would challenge, and a server that sends every request to it
+    const elsewhere = await recording((_req, res) => res.writeHead(401).end())
+    const server = await recording((_req, res) => res.writeHead(307, { location: elsewhere.url }).end())
+
+    // When the probe carries a header the user set for that server
+    const challenged = await serverIssuesAuthChallenge(server.url, { 'X-Api-Key': 'secret' })
+
+    // Then the other origin heard nothing, and its challenge is not taken for the server's
+    expect(elsewhere.reached).toEqual([])
+    expect(challenged).toBe(false)
+  })
+
+  it('Scenario: A probe redirected within the server still finds its challenge', async () => {
+    // Given a server that moves the request to its own trailing slash before challenging it
+    const server = await recording((req, res) => {
+      if (req.url === '/mcp') res.writeHead(308, { location: '/mcp/' }).end()
+      else res.writeHead(401).end()
+    })
+
+    const challenged = await serverIssuesAuthChallenge(server.url, { 'X-Api-Key': 'secret' })
+
+    // Then the header went along, because it is still the server it was set for
+    expect(challenged).toBe(true)
+    expect(server.reached.map((headers) => headers['x-api-key'])).toEqual(['secret', 'secret'])
+  })
 })

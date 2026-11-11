@@ -522,6 +522,10 @@ way as for every other flow, and `client_secret_basic` or `client_secret_post` i
 authorization server advertises. No refresh token is involved: the credentials are the durable thing, so
 an expired token is replaced by asking for another the same way the first was obtained.
 
+The token endpoint must use HTTPS, except for an HTTP loopback endpoint, and a redirect from it is
+followed only within the same origin — so the secret is never sent on to a host the endpoint merely
+points at.
+
 If an internal server does not publish RFC 9728 or RFC 8414/OIDC discovery metadata, provide its known
 token endpoint explicitly. This skips discovery and is accepted only with `--client-credentials`:
 
@@ -573,6 +577,10 @@ The server has to advertise `device_authorization_endpoint` in its authorization
 mcp-remote fails with a clear message rather than falling back to a browser that isn't there. Note
 that servers offering this grant often expect a pre-registered client — pair it with
 `--static-oauth-client-info` if dynamic registration is refused.
+
+Both that endpoint and the token endpoint must use HTTPS, except for an HTTP loopback endpoint, and a
+redirect from either is followed only within the same origin. `--allow-http` does not relax this: it
+does not extend to the authorization server's endpoints.
 
 ### Load Balancer Session Stickiness
 

@@ -221,3 +221,122 @@ describe('Feature: Signing in without a browser', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 })
+
+/**
+ * Both endpoints come out of metadata the MCP server points at, and both requests can carry a
+ * client secret. CVE-2026-108716 was the first half of this: nothing asked for https. The second
+ * half is what a redirect does to the first - an endpoint that passes can still answer with one.
+ */
+describe('Feature: The device grant sends credentials only where the metadata securely points', () => {
+  let fetchMock: any
+
+  /** A client with a secret, and a server that takes it in the body - where a redirect would carry it along. */
+  const confidential = {
+    metadata: { ...metadata, token_endpoint_auth_methods_supported: ['client_secret_post'] },
+    clientInformation: { client_id: 'c1', client_secret: 'shh' },
+  }
+
+  const redirect = (location: string) => new Response(null, { status: 307, headers: { location } })
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    vi.clearAllMocks()
+  })
+
+  it('Scenario: A plain-http device authorization endpoint is refused before anything is sent', async () => {
+    await expect(
+      authorizeWithDeviceCode({
+        ...confidential,
+        metadata: { ...confidential.metadata, device_authorization_endpoint: 'http://auth.example.com/device' },
+      }),
+    ).rejects.toThrow('Refusing to use the device authorization endpoint at http://auth.example.com over http')
+
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('Scenario: A plain-http token endpoint is refused before the device request is made', async () => {
+    // Refusing it only once polling began would be after someone had been sent to approve a code
+    await expect(
+      authorizeWithDeviceCode({
+        ...confidential,
+        metadata: { ...confidential.metadata, token_endpoint: 'http://auth.example.com/token' },
+      }),
+    ).rejects.toThrow('Refusing to use the token endpoint at http://auth.example.com over http')
+
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('Scenario: An endpoint that is not a URL at all is refused by name', async () => {
+    await expect(
+      authorizeWithDeviceCode({ metadata: { ...metadata, device_authorization_endpoint: '/device' }, clientInformation }),
+    ).rejects.toThrow("The authorization server's device authorization endpoint is not a valid URL: /device")
+
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('Scenario: http on loopback is still allowed, for local development', async () => {
+    fetchMock.mockResolvedValueOnce(json(200, issued)).mockResolvedValueOnce(json(200, tokens))
+
+    const result = await runFlow({
+      metadata: {
+        ...metadata,
+        device_authorization_endpoint: 'http://127.0.0.1:9000/device',
+        token_endpoint: 'http://localhost:9000/token',
+      },
+      clientInformation,
+    })
+
+    expect(result.access_token).toBe('at')
+    expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.1:9000/device')
+    expect(fetchMock.mock.calls[1][0]).toBe('http://localhost:9000/token')
+  })
+
+  it('Scenario: A device authorization endpoint that redirects to another origin is not followed', async () => {
+    // Given an https endpoint that answers by pointing at a plain-http host
+    fetchMock.mockResolvedValueOnce(redirect('http://elsewhere.example.com/device'))
+
+    // Then the sign-in stops, saying where it was pointed
+    await expect(authorizeWithDeviceCode(confidential)).rejects.toThrow(
+      'The device authorization endpoint at https://auth.example.com answered HTTP 307 with a redirect to http://elsewhere.example.com/device',
+    )
+
+    // And the one request made was to the endpoint in the metadata, with the redirect left unfollowed
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][0]).toBe('https://auth.example.com/device')
+    expect(fetchMock.mock.calls[0][1].redirect).toBe('manual')
+  })
+
+  it('Scenario: A token endpoint that redirects to another origin while polling is not followed', async () => {
+    // Given a code issued normally, and a token endpoint that answers by pointing somewhere else
+    fetchMock.mockResolvedValueOnce(json(200, issued)).mockResolvedValueOnce(redirect('https://elsewhere.example.com/token'))
+
+    // Then polling stops rather than carrying the device code and the secret there
+    await expect(runFlow(confidential)).rejects.toThrow(
+      'The token endpoint at https://auth.example.com answered HTTP 307 with a redirect to https://elsewhere.example.com/token',
+    )
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    for (const call of fetchMock.mock.calls) {
+      expect(new URL(call[0]).origin).toBe('https://auth.example.com')
+    }
+  })
+
+  it('Scenario: A redirect within the same origin is followed, credentials and all', async () => {
+    // Given a server that moves the device request to its own trailing slash
+    fetchMock.mockResolvedValueOnce(redirect('/device/')).mockResolvedValueOnce(json(200, issued)).mockResolvedValueOnce(json(200, tokens))
+
+    const result = await runFlow(confidential)
+
+    // Then the request is repeated there as it was, and the sign-in completes
+    expect(result.access_token).toBe('at')
+    expect(String(fetchMock.mock.calls[1][0])).toBe('https://auth.example.com/device/')
+    expect(new URLSearchParams(fetchMock.mock.calls[1][1].body.toString()).get('client_secret')).toBe('shh')
+  })
+})

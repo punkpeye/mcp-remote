@@ -3,6 +3,7 @@ import { selectClientAuthMethod } from '@modelcontextprotocol/client'
 import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/client'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
 import { applyClientAuthentication } from './device-authorization'
+import { isSecureEndpoint, postWithinOrigin } from './endpoint-policy'
 import { log, debugLog } from './utils'
 
 /**
@@ -39,7 +40,7 @@ export async function authorizeWithClientCredentials({
   // to lose; this one sends a long-lived machine credential with nobody watching, so it does not
   // send it in the clear - and it says where it went, at a level the user sees without --debug.
   const endpoint = new URL(tokenEndpoint)
-  if (endpoint.protocol !== 'https:' && endpoint.hostname !== 'localhost' && endpoint.hostname !== '127.0.0.1') {
+  if (!isSecureEndpoint(endpoint)) {
     throw new Error(
       `Refusing to send the client secret to ${endpoint.origin} over ${endpoint.protocol.replace(':', '')}. ` +
         'The client_credentials grant needs an https token endpoint.',
@@ -66,7 +67,9 @@ export async function authorizeWithClientCredentials({
 
   debugLog('Requesting a token with the client_credentials grant', { tokenEndpoint, authMethod, scope, resource: resource?.href })
 
-  const response = await fetch(tokenEndpoint, { method: 'POST', headers, body: params })
+  // The check above saw the endpoint as the metadata named it. A redirect names another one, so it
+  // is followed only within the same origin - otherwise the secret would go wherever it pointed.
+  const response = await postWithinOrigin('token endpoint', tokenEndpoint, { headers, body: params })
 
   if (!response.ok) {
     const body = (await response.json().catch(() => undefined)) as { error?: string; error_description?: string } | undefined

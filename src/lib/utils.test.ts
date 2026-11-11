@@ -4935,3 +4935,37 @@ describe('Feature: OAuth failures report what the server said', () => {
     }
   })
 })
+
+describe('Feature: Probing the server before OAuth discovery', () => {
+  it("Scenario: A probe redirected to another origin does not take the user's headers there", async () => {
+    // Given somewhere else that would answer with a challenge of its own
+    const reached: string[] = []
+    const elsewhere = createServer((req, res) => {
+      reached.push(`${req.method} ${req.url}`)
+      res.writeHead(401, { 'www-authenticate': 'Bearer scope="not-this-servers"' }).end()
+    })
+    await new Promise<void>((resolve) => elsewhere.listen(0, '127.0.0.1', resolve))
+    const elsewherePort = (elsewhere.address() as net.AddressInfo).port
+
+    // And a server whose MCP endpoint points there, publishing no metadata of its own
+    const server = createServer((req, res) => {
+      if (req.url === '/mcp') res.writeHead(307, { location: `http://127.0.0.1:${elsewherePort}/mcp` }).end()
+      else res.writeHead(404).end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const serverUrl = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}/mcp`
+
+    try {
+      // When discovery probes it with a header the user set for that server
+      const result = await discoverOAuthServerInfo(serverUrl, { 'X-Api-Key': 'secret' })
+
+      // Then the other origin heard nothing, and nothing it would have said is taken for the server's
+      expect(reached).toEqual([])
+      expect(result.wwwAuthenticateScope).toBeUndefined()
+      expect(result.authorizationServerUrl).toBe(serverUrl)
+    } finally {
+      await new Promise<void>((resolve) => (elsewhere.closeAllConnections(), elsewhere.close(() => resolve())))
+      await new Promise<void>((resolve) => (server.closeAllConnections(), server.close(() => resolve())))
+    }
+  })
+})

@@ -2,6 +2,7 @@ import { OAuthTokensSchema } from '@modelcontextprotocol/core'
 import { selectClientAuthMethod } from '@modelcontextprotocol/client'
 import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/client'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
+import { isSecureEndpoint, postWithinOrigin } from './endpoint-policy'
 import { log, debugLog } from './utils'
 
 /** RFC 8628. The grant this module exchanges, and the one a server has to advertise to offer it. */
@@ -75,6 +76,13 @@ export async function authorizeWithDeviceCode({
     throw new Error('The authorization server metadata has no token endpoint')
   }
 
+  // Both endpoints come from metadata the MCP server points at, so it is the server that chooses
+  // where the client's credentials, the device code and the issued tokens travel. Both are checked
+  // before the first request: refusing the token endpoint only once polling began would be after
+  // someone had been sent to approve a code that could never be redeemed.
+  requireSecureEndpoint(deviceAuthorizationEndpoint, 'device authorization endpoint')
+  requireSecureEndpoint(metadata.token_endpoint, 'token endpoint')
+
   const authMethod = selectClientAuthMethod(clientInformation, metadata.token_endpoint_auth_methods_supported ?? [])
 
   const authorization = await requestDeviceAuthorization(deviceAuthorizationEndpoint, {
@@ -104,6 +112,29 @@ export async function authorizeWithDeviceCode({
   })
 }
 
+/**
+ * Refuses an endpoint that would put the client's credentials, the device code or the tokens on the
+ * wire in the clear - the rule the client_credentials grant and the SDK's own token requests apply.
+ *
+ * @param value The endpoint as the metadata named it
+ * @param name What the endpoint is, for the error
+ */
+function requireSecureEndpoint(value: string, name: string): void {
+  let endpoint: URL
+  try {
+    endpoint = new URL(value)
+  } catch {
+    throw new Error(`The authorization server's ${name} is not a valid URL: ${value.slice(0, 200)}`)
+  }
+
+  if (!isSecureEndpoint(endpoint)) {
+    throw new Error(
+      `Refusing to use the ${name} at ${endpoint.origin} over ${endpoint.protocol.replace(':', '')}. ` +
+        'The device grant needs https endpoints, or http on a loopback host.',
+    )
+  }
+}
+
 async function requestDeviceAuthorization(
   endpoint: string,
   options: {
@@ -121,7 +152,9 @@ async function requestDeviceAuthorization(
 
   debugLog('Requesting device authorization', { endpoint, scope: options.scope })
 
-  const response = await fetch(endpoint, { method: 'POST', headers, body: params })
+  // Followed only within the endpoint's own origin: whoever answers this chooses the address the
+  // person is sent to approve at, and with `client_secret_post` is handed the secret as well
+  const response = await postWithinOrigin('device authorization endpoint', endpoint, { headers, body: params })
   if (!response.ok) {
     throw new Error(`Device authorization request failed (HTTP ${response.status}): ${await errorDetail(response)}`)
   }
@@ -161,7 +194,8 @@ async function pollForTokens(
     applyClientAuthentication(options.authMethod, options.clientInformation, headers, params)
     if (options.resource) params.set('resource', options.resource.href)
 
-    const response = await fetch(tokenEndpoint, { method: 'POST', headers, body: params })
+    // The device code is a bearer credential for the approval under way, so it stays in this origin
+    const response = await postWithinOrigin('token endpoint', tokenEndpoint, { headers, body: params })
     if (response.ok) {
       log('Authorized.')
       return OAuthTokensSchema.parse(await response.json())

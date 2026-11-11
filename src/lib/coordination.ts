@@ -1,3 +1,4 @@
+import { fetchWithinOrigin } from './endpoint-policy'
 import { readJsonFile } from './mcp-auth-config'
 import { OAuthTokensWithExpiresAtSchema } from './node-oauth-client-provider'
 import { AuthCodeResult } from './types'
@@ -190,10 +191,13 @@ async function portHeldBySiblingFor(port: number, serverUrlHash: string, bindHos
  * client from inside `transport.start()`. But that is only worth doing for a server that actually
  * wants OAuth: a public one, or one authenticated by `--header`, never writes tokens, so every
  * instance but the first would wait out the handoff timeout and exit.
+ *
+ * The `--header` values ride along, so a redirect is followed only within the server's own origin,
+ * as the transport does when it connects. Anywhere else is not the server those were set for.
  */
 export async function serverIssuesAuthChallenge(serverUrl: string, headers: Record<string, string> = {}): Promise<boolean> {
   try {
-    const response = await fetch(serverUrl, {
+    const response = await fetchWithinOrigin(fetch)(serverUrl, {
       method: 'GET',
       headers: { ...headers, accept: 'application/json, text/event-stream' },
       signal: AbortSignal.timeout(5000),

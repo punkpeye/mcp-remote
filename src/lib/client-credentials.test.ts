@@ -83,4 +83,61 @@ describe('Feature: Signing in as the software itself', () => {
       'no token endpoint',
     )
   })
+
+  it('Scenario: A token endpoint over plain http is refused before the secret is sent', async () => {
+    await expect(
+      authorizeWithClientCredentials({ metadata: { ...metadata, token_endpoint: 'http://auth.example.com/token' }, clientInformation }),
+    ).rejects.toThrow('Refusing to send the client secret to http://auth.example.com over http')
+
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['http://localhost:9000/token', 'http://127.0.0.1:9000/token', 'http://[::1]:9000/token'])(
+    'Scenario: http on loopback is still allowed, for local development (%s)',
+    async (token_endpoint) => {
+      // `[::1]` is here because `--token-endpoint` accepts it, and this check used to refuse it
+      fetchMock.mockResolvedValue(json(200, tokens))
+
+      const result = await authorizeWithClientCredentials({ metadata: { ...metadata, token_endpoint }, clientInformation })
+
+      expect(result.access_token).toBe('at')
+      expect(fetchMock.mock.calls[0][0]).toBe(token_endpoint)
+    },
+  )
+
+  it('Scenario: A token endpoint that redirects to another origin is not followed', async () => {
+    // Given an https endpoint that passes the check above, then answers by pointing at a plain-http
+    // host - and a server taking the secret in the body, which a 307 would carry along
+    fetchMock.mockResolvedValue(new Response(null, { status: 307, headers: { location: 'http://elsewhere.example.com/token' } }))
+
+    // Then the grant fails, saying where it was pointed
+    await expect(
+      authorizeWithClientCredentials({
+        metadata: { ...metadata, token_endpoint_auth_methods_supported: ['client_secret_post'] },
+        clientInformation,
+      }),
+    ).rejects.toThrow(
+      'The token endpoint at https://auth.example.com answered HTTP 307 with a redirect to http://elsewhere.example.com/token',
+    )
+
+    // And the secret went to the endpoint in the metadata and nowhere else
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][0]).toBe('https://auth.example.com/token')
+    expect(fetchMock.mock.calls[0][1].redirect).toBe('manual')
+  })
+
+  it('Scenario: A redirect within the same origin is followed, secret and all', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response(null, { status: 308, headers: { location: '/token/' } }))
+      .mockResolvedValueOnce(json(200, tokens))
+
+    const result = await authorizeWithClientCredentials({
+      metadata: { ...metadata, token_endpoint_auth_methods_supported: ['client_secret_post'] },
+      clientInformation,
+    })
+
+    expect(result.access_token).toBe('at')
+    expect(String(fetchMock.mock.calls[1][0])).toBe('https://auth.example.com/token/')
+    expect(new URLSearchParams(fetchMock.mock.calls[1][1].body.toString()).get('client_secret')).toBe('s1')
+  })
 })

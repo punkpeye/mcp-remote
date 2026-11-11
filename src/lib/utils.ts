@@ -52,6 +52,7 @@ import {
 } from './protected-resource-metadata'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import { createCookieJar } from './cookie-jar'
+import { fetchWithinOrigin } from './endpoint-policy'
 import express from 'express'
 import { AddressInfo } from 'net'
 import { Server } from 'http'
@@ -1907,10 +1908,12 @@ export async function discoverOAuthServerInfo(
   let wwwAuthenticateHeader: string | undefined
   let wwwAuthenticateScope: string | undefined
 
-  // Step 1: Probe the MCP server to get WWW-Authenticate header
+  // Step 1: Probe the MCP server to get WWW-Authenticate header. The `--header` values ride along,
+  // so a redirect is followed only within the server's own origin, as the transport does when it
+  // connects - anywhere else is not the server those were set for.
   try {
     debugLog('Probing MCP server for WWW-Authenticate header')
-    const response = await fetch(serverUrl, {
+    const response = await fetchWithinOrigin(fetch)(serverUrl, {
       method: 'GET',
       headers: {
         ...headers,
