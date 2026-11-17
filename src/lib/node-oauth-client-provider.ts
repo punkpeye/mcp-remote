@@ -314,10 +314,19 @@ export interface TokenRequestCoordinator {
 }
 
 /**
+ * Whether the SDK should skip the RFC 8414 §3.3 issuer echo check when it discovers the
+ * authorization server. The transports take this as their own option rather than reading it off
+ * the provider, so `connectToRemoteServer` asks the provider for it when it builds them.
+ */
+export interface IssuerMetadataValidationPolicy {
+  readonly skipIssuerMetadataValidation: boolean
+}
+
+/**
  * Implements the OAuthClientProvider interface for Node.js environments.
  * Handles OAuth flow and token storage for MCP clients.
  */
-export class NodeOAuthClientProvider implements OAuthClientProvider, TokenRequestCoordinator {
+export class NodeOAuthClientProvider implements OAuthClientProvider, TokenRequestCoordinator, IssuerMetadataValidationPolicy {
   private serverUrlHash: string
   private callbackPath: string
   private clientName: string
@@ -339,6 +348,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
   private authorizeResource: string | undefined
   private authorizeParams: Record<string, string>
   private skipResourceParameter: boolean
+  /** See {@link IssuerMetadataValidationPolicy}. Off unless `--skip-issuer-metadata-validation` is passed. */
+  readonly skipIssuerMetadataValidation: boolean
   /**
    * Overrides how the SDK picks the RFC 8707 `resource` indicator. Only defined when we have
    * an opinion; otherwise the SDK derives it from Protected Resource Metadata as usual.
@@ -398,6 +409,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
     const trimmedAuthorizeResource = options.authorizeResource?.trim()
     this.authorizeResource = trimmedAuthorizeResource ? trimmedAuthorizeResource : undefined
     this.skipResourceParameter = options.skipResourceParameter ?? false
+    this.skipIssuerMetadataValidation = options.skipIssuerMetadataValidation ?? false
     this.authorizeParams = options.authorizeParams ?? {}
     this._state = randomUUID()
     this._clientInfo = undefined
@@ -973,7 +985,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
     if (!this.clientCredentialsInFlight) {
       // The SDK's non-interactive path does not call tokens(), so this cannot recurse. Use the same
       // configured endpoint, scope, resource, client authentication and fetch as its 401 retry.
-      this.clientCredentialsInFlight = auth(this, { serverUrl: this.resourceServerUrl, scope, fetchFn: this.options.fetchFn })
+      this.clientCredentialsInFlight = auth(this, {
+        serverUrl: this.resourceServerUrl,
+        scope,
+        fetchFn: this.options.fetchFn,
+        skipIssuerMetadataValidation: this.skipIssuerMetadataValidation,
+      })
         .then(() => {})
         .finally(() => {
           this.clientCredentialsInFlight = null

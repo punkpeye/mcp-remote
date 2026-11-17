@@ -169,6 +169,64 @@ Some authorization servers reject the resource parameter outright — Microsoft 
 }
 ```
 
+### Authorization server issuer validation
+
+RFC 8414 §3.3 has a client reject authorization server metadata whose `issuer` is not exactly the URL
+it was discovered from, and mcp-remote does. That check is what stops one authorization server's
+metadata from being passed off as another's.
+
+Microsoft Entra ID's multi-tenant endpoints (`/organizations/v2.0`, `/common/v2.0`) fail it. Their
+discovery document publishes the literal template `https://login.microsoftonline.com/{tenantid}/v2.0`
+as the issuer, so a server that points at one - Microsoft Agent 365, for example - stops at:
+
+```
+Issuer mismatch in authorization server metadata (RFC 8414 §3.3):
+expected "https://login.microsoftonline.com/organizations/v2.0",
+received "https://login.microsoftonline.com/{tenantid}/v2.0"
+```
+
+`--skip-issuer-metadata-validation` turns that one check off. It is off by default, and nothing else
+changes: TLS, PKCE, `state`, the RFC 9207 `iss` check on the callback, and the resource and scope
+handling all still apply. Entra ID has no dynamic client registration, so this is usually combined
+with `--static-oauth-client-info` and a fixed callback, whose redirect URI (`http://127.0.0.1:51001/`
+below) must be registered on that app in Entra:
+
+```json
+{
+  "mcpServers": {
+    "agent365-calendar": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote@latest",
+        "https://agent365.svc.cloud.microsoft/agents/tenants/YOUR_TENANT_ID/servers/mcp_CalendarTools",
+        "51001",
+        "--host",
+        "127.0.0.1",
+        "--callback-path",
+        "/",
+        "--static-oauth-client-info",
+        "@/Users/you/.config/mcp-remote/client.json",
+        "--skip-issuer-metadata-validation"
+      ]
+    }
+  }
+}
+```
+
+with `client.json` holding the app registration, e.g. `{ "client_id": "YOUR_ENTRA_CLIENT_ID" }`. Most
+MCP clients start the command without a shell, so write the path out in full: `~` and `$HOME` are not
+expanded.
+
+**Only use this for a server you configured yourself, whose authorization server you trust.** The
+check does not choose the authorization server - protected-resource metadata does, and metadata at
+any URL that names itself passes. What it guarantees is that the issuer everything afterwards is
+compared with - the callback's `iss` (RFC 9207), the issuer stamped on the saved client registration
+and tokens - is the place the metadata really came from. With the flag set, the document's own claim
+is taken instead, so metadata served from one place can claim to be another authorization server:
+the precondition for an authorization server mix-up. The flag applies to every authorization server
+this instance discovers, not just Entra ID, and is not part of the credential cache key.
+
 ### Flags
 
 * If `npx` is producing errors, consider adding `-y` as the first argument to auto-accept the installation of the `mcp-remote` package.

@@ -4715,6 +4715,41 @@ describe('Feature: Resource Indicator Flags', () => {
   })
 })
 
+describe('Feature: Issuer metadata validation flag', () => {
+  it('Scenario: Issuer metadata validation stays on by default', async () => {
+    const result = await parseCommandLineArgs(['https://example.com/mcp'], 'test usage')
+    expect(result.skipIssuerMetadataValidation).toBe(false)
+  })
+
+  it('Scenario: --skip-issuer-metadata-validation opts out, alongside a static Entra client', async () => {
+    const result = await parseCommandLineArgs(
+      [
+        'https://example.com/mcp',
+        '51001',
+        '--host',
+        '127.0.0.1',
+        '--callback-path',
+        '/',
+        '--static-oauth-client-info',
+        '{"client_id":"entra-client-id"}',
+        '--skip-issuer-metadata-validation',
+      ],
+      'test usage',
+    )
+    expect(result.skipIssuerMetadataValidation).toBe(true)
+    expect(result.staticOAuthClientInfo).toEqual({ client_id: 'entra-client-id' })
+    expect(result.callbackPort).toBe(51001)
+    expect(result.callbackPath).toBe('/')
+  })
+
+  it('Scenario: Opting out does not move the credential cache', async () => {
+    // The flag changes what discovery accepts, not which server or client the tokens belong to
+    const without = await parseCommandLineArgs(['https://example.com/mcp'], 'test usage')
+    const withFlag = await parseCommandLineArgs(['https://example.com/mcp', '--skip-issuer-metadata-validation'], 'test usage')
+    expect(withFlag.serverUrlHash).toBe(without.serverUrlHash)
+  })
+})
+
 describe('Feature: Keeping an idle connection alive', () => {
   const mockTransport = () =>
     ({

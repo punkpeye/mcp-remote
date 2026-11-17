@@ -10,7 +10,7 @@ import {
   UnauthorizedError,
 } from '@modelcontextprotocol/client'
 import type { FetchLike, OAuthClientInformationFull, Transport } from '@modelcontextprotocol/client'
-import type { TokenRequestCoordinator } from './node-oauth-client-provider'
+import type { IssuerMetadataValidationPolicy, TokenRequestCoordinator } from './node-oauth-client-provider'
 import {
   canFulfilInputRequest,
   discoverRequest,
@@ -188,6 +188,14 @@ export const fetchWithMcpHeaders = (async (url: string | URL, init?: RequestInit
 function coordinatedFetch(authProvider: OAuthClientProvider | undefined, fetchFn: FetchLike): FetchLike {
   const coordinator = authProvider as Partial<TokenRequestCoordinator> | undefined
   return typeof coordinator?.coordinateTokenRequests === 'function' ? coordinator.coordinateTokenRequests(fetchFn) : fetchFn
+}
+
+/**
+ * Whether the provider has opted out of the SDK's RFC 8414 §3.3 issuer echo check. Anything but an
+ * explicit `true` keeps the check, so a provider that says nothing is validated as before.
+ */
+function skipsIssuerMetadataValidation(authProvider: OAuthClientProvider | undefined): boolean {
+  return (authProvider as Partial<IssuerMetadataValidationPolicy> | undefined)?.skipIssuerMetadataValidation === true
 }
 
 /** Statuses the `Response` constructor refuses a body for, per the fetch spec's null body statuses. */
@@ -2123,6 +2131,9 @@ export async function connectToRemoteServer(
   const transportFetch = coordinatedFetch(authProvider, fetchWithMcpHeaders)
   // The casts bridge types only, as for `fetchWithMcpHeaders`
   const eventStreamFetch = coordinatedFetch(authProvider, fetch as unknown as FetchLike) as unknown as typeof fetch
+  // Every transport below runs the SDK's discovery - on a 401, and again in finishAuth - so each
+  // one has to be told; a transport left out would still reject the metadata the others accepted.
+  const skipIssuerMetadataValidation = skipsIssuerMetadataValidation(authProvider)
 
   // Every attempt the EventSource makes to open the stream comes through the `fetch` below,
   // including the ones it makes on its own after the connection drops. Counting them is how a
@@ -2176,11 +2187,13 @@ export async function connectToRemoteServer(
         requestInit: { headers },
         eventSourceInit,
         fetch: transportFetch,
+        skipIssuerMetadataValidation,
       })
     : new StreamableHTTPClientTransport(url, {
         authProvider,
         requestInit: { headers },
         fetch: transportFetch,
+        skipIssuerMetadataValidation,
       })
 
   // When connecting without a Client (proxy mode), the auth challenge (401) is not received by
@@ -2215,6 +2228,7 @@ export async function connectToRemoteServer(
           authProvider,
           requestInit: { headers },
           fetch: transportFetch,
+          skipIssuerMetadataValidation,
         })
         // This transport is the one that will receive (and store the metadata from) any 401 challenge.
         authChallengeTransport = testTransport
@@ -3218,6 +3232,17 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     log(`Using authorize resource: ${authorizeResource}`)
   }
 
+  // RFC 8414 §3.3 has the client reject authorization server metadata whose `issuer` is not the
+  // URL it was discovered from. Entra ID's multi-tenant endpoints (/organizations, /common) publish
+  // the literal template `https://login.microsoftonline.com/{tenantid}/v2.0` there, so they fail
+  // it. Opt-in only: switching it off weakens the authorization server mix-up defence.
+  const skipIssuerMetadataValidation = args.includes('--skip-issuer-metadata-validation')
+  if (skipIssuerMetadataValidation) {
+    log(
+      'Warning: --skip-issuer-metadata-validation is set; authorization server metadata will be accepted even when its issuer does not match the server it was discovered from (RFC 8414 §3.3)',
+    )
+  }
+
   const authorizeParams = parseAuthorizeParams(args)
   if (Object.keys(authorizeParams).length > 0) {
     log(`Using extra authorization parameters: ${Object.keys(authorizeParams).join(', ')}`)
@@ -3330,6 +3355,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     tokenEndpoint,
     authorizeResource,
     skipResourceParameter,
+    skipIssuerMetadataValidation,
     authorizeParams,
     ignoredTools,
     authTimeoutMs,
