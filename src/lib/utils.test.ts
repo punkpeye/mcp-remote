@@ -4750,6 +4750,158 @@ describe('Feature: Issuer metadata validation flag', () => {
   })
 })
 
+describe('Feature: Choosing the authorization server with --authorization-server', () => {
+  const tenant = 'https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0'
+
+  it('Scenario: Absent, nothing changes', async () => {
+    const result = await parseCommandLineArgs(['https://example.com/mcp'], 'test usage')
+    expect(result.authorizationServer).toBeUndefined()
+    // Every existing cache keeps its key
+    expect(result.serverUrlHash).toBe(getServerUrlHash('https://example.com/mcp', undefined, {}))
+  })
+
+  it('Scenario: The URL is kept exactly as given, since it is compared with the issuer character for character', async () => {
+    const result = await parseCommandLineArgs(['https://example.com/mcp', '--authorization-server', tenant], 'test usage')
+    expect(result.authorizationServer).toBe(tenant)
+
+    // A bare origin must not grow the trailing slash new URL() would give it
+    const bare = await parseCommandLineArgs(['https://example.com/mcp', '--authorization-server', 'https://auth.example.com'], 'test usage')
+    expect(bare.authorizationServer).toBe('https://auth.example.com')
+  })
+
+  it('Scenario: Tokens from another authorization server are kept apart', async () => {
+    const without = await parseCommandLineArgs(['https://example.com/mcp'], 'test usage')
+    const pinned = await parseCommandLineArgs(['https://example.com/mcp', '--authorization-server', tenant], 'test usage')
+    const other = await parseCommandLineArgs(
+      ['https://example.com/mcp', '--authorization-server', 'https://login.microsoftonline.com/other-tenant/v2.0'],
+      'test usage',
+    )
+    expect(pinned.serverUrlHash).not.toBe(without.serverUrlHash)
+    expect(pinned.serverUrlHash).not.toBe(other.serverUrlHash)
+  })
+
+  it('Scenario: Works alongside a static client and a fixed callback', async () => {
+    const result = await parseCommandLineArgs(
+      [
+        'https://example.com/mcp',
+        '51001',
+        '--host',
+        'localhost',
+        '--callback-path',
+        '/',
+        '--static-oauth-client-info',
+        '{"client_id":"entra-client-id"}',
+        '--authorization-server',
+        tenant,
+      ],
+      'test usage',
+    )
+    expect(result.authorizationServer).toBe(tenant)
+    expect(result.skipIssuerMetadataValidation).toBe(false)
+    expect(result.staticOAuthClientInfo).toEqual({ client_id: 'entra-client-id' })
+  })
+
+  it.each([
+    [[], /requires an HTTPS URL/],
+    [['--debug'], /requires an HTTPS URL/],
+    [['not a url'], /Invalid --authorization-server/],
+    [['http://auth.example.com'], /must use HTTPS/],
+    [['https://user:pass@auth.example.com'], /must not contain credentials/],
+    [['https://auth.example.com/?tenant=x'], /query string/],
+    [['https://auth.example.com/#x'], /fragment/],
+  ])('Scenario: Rejects --authorization-server %j', async (value, message) => {
+    await expect(parseCommandLineArgs(['https://example.com/mcp', '--authorization-server', ...value], 'test usage')).rejects.toThrow(
+      message,
+    )
+  })
+
+  it('Scenario: Allows plain HTTP on loopback, for a local authorization server', async () => {
+    const result = await parseCommandLineArgs(
+      ['https://example.com/mcp', '--authorization-server', 'http://127.0.0.1:9000/realm'],
+      'test usage',
+    )
+    expect(result.authorizationServer).toBe('http://127.0.0.1:9000/realm')
+  })
+
+  it('Scenario: Refuses to combine with --token-endpoint, which skips discovery', async () => {
+    await expect(
+      parseCommandLineArgs(
+        [
+          'https://example.com/mcp',
+          '--client-credentials',
+          '--token-endpoint',
+          'https://auth.example.com/token',
+          '--authorization-server',
+          'https://auth.example.com',
+        ],
+        'test usage',
+      ),
+    ).rejects.toThrow(/cannot be combined with --token-endpoint/)
+  })
+})
+
+describe('Feature: Discovery with --authorization-server', () => {
+  let server: ReturnType<typeof createServer>
+  let origin: string
+  const served: string[] = []
+
+  beforeEach(async () => {
+    served.length = 0
+    server = createServer((req, res) => {
+      served.push(req.url ?? '')
+      const json = (body: unknown) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+      if (req.url === '/mcp') {
+        res.writeHead(401, { 'www-authenticate': `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"` }).end()
+      } else if (req.url === '/.well-known/oauth-protected-resource/mcp') {
+        json({ resource: `${origin}/mcp`, authorization_servers: [`${origin}/shared`], scopes_supported: ['calendar'] })
+      } else if (req.url === '/.well-known/oauth-authorization-server/tenant') {
+        json({ issuer: `${origin}/tenant`, authorization_endpoint: `${origin}/tenant/authorize`, token_endpoint: `${origin}/tenant/token` })
+      } else if (req.url === '/.well-known/oauth-authorization-server/shared') {
+        json({ issuer: `${origin}/shared`, authorization_endpoint: `${origin}/shared/authorize`, token_endpoint: `${origin}/shared/token` })
+      } else {
+        res.writeHead(404).end()
+      }
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    origin = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`
+  })
+
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    await new Promise<void>((resolve) => (server.closeAllConnections(), server.close(() => resolve())))
+  })
+
+  it('Scenario: Without it, the advertised authorization server is used', async () => {
+    const result = await discoverOAuthServerInfo(`${origin}/mcp`)
+    expect(result.authorizationServerUrl).toBe(`${origin}/shared`)
+    expect(result.authorizationServerMetadata?.issuer).toBe(`${origin}/shared`)
+  })
+
+  it('Scenario: With it, metadata comes from the chosen server and scopes still from the protected resource', async () => {
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const result = await discoverOAuthServerInfo(`${origin}/mcp`, {}, undefined, `${origin}/tenant`)
+
+    expect(result.authorizationServerUrl).toBe(`${origin}/tenant`)
+    expect(result.authorizationServerMetadata?.token_endpoint).toBe(`${origin}/tenant/token`)
+    expect(result.protectedResourceMetadata?.scopes_supported).toEqual(['calendar'])
+    expect(served).not.toContain('/.well-known/oauth-authorization-server/shared')
+    // Same host as the advertised server: said plainly, not as a warning
+    const said = stderr.mock.calls.map((call) => String(call[0])).join('\n')
+    expect(said).toContain(`Signing in at ${origin}/tenant (--authorization-server) instead of ${origin}/shared`)
+    expect(said).not.toContain('Warning: --authorization-server')
+  })
+
+  it('Scenario: A chosen server on a host nothing advertised is warned about', async () => {
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await discoverOAuthServerInfo(`${origin}/mcp`, {}, undefined, 'http://localhost:9/elsewhere')
+
+    const said = stderr.mock.calls.map((call) => String(call[0])).join('\n')
+    expect(said).toContain('Warning: --authorization-server http://localhost:9/elsewhere is not on the host of any authorization server')
+  })
+})
+
 describe('Feature: Keeping an idle connection alive', () => {
   const mockTransport = () =>
     ({

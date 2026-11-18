@@ -169,13 +169,27 @@ Some authorization servers reject the resource parameter outright — Microsoft 
 }
 ```
 
+### Choosing the authorization server
+
+A server says which authorization server to sign in at in its protected-resource metadata (RFC 9728).
+`--authorization-server <url>` signs in somewhere else instead. Everything else stays the same: the
+server's metadata is still read for scopes and the resource indicator, and the chosen server's own
+metadata is validated as strictly as any other.
+
+mcp-remote does not refuse a server the resource never named, since that is your call. But it does
+say so when you use one, and warns when it is not on the host of any server the resource advertises.
+Tokens signed in this way are cached separately. `--authorization-server` cannot be combined with
+`--token-endpoint`, which skips discovery altogether.
+
 ### Authorization server issuer validation
 
 RFC 8414 §3.3 has a client reject authorization server metadata whose `issuer` is not exactly the URL
 it was discovered from, and mcp-remote does. That check is what stops one authorization server's
 metadata from being passed off as another's.
 
-Microsoft Entra ID's multi-tenant endpoints (`/organizations/v2.0`, `/common/v2.0`) fail it. Their
+#### Microsoft Entra ID
+
+Entra ID's multi-tenant endpoints (`/organizations/v2.0`, `/common/v2.0`) fail that check. Their
 discovery document publishes the literal template `https://login.microsoftonline.com/{tenantid}/v2.0`
 as the issuer, so a server that points at one - Microsoft Agent 365, for example - stops at:
 
@@ -185,11 +199,8 @@ expected "https://login.microsoftonline.com/organizations/v2.0",
 received "https://login.microsoftonline.com/{tenantid}/v2.0"
 ```
 
-`--skip-issuer-metadata-validation` turns that one check off. It is off by default, and nothing else
-changes: TLS, PKCE, `state`, the RFC 9207 `iss` check on the callback, and the resource and scope
-handling all still apply. Entra ID has no dynamic client registration, so this is usually combined
-with `--static-oauth-client-info` and a fixed callback, whose redirect URI (`http://127.0.0.1:51001/`
-below) must be registered on that app in Entra:
+The fix that keeps the check is to sign in at your tenant's own endpoint, whose issuer is exactly its
+own URL, with `--authorization-server`:
 
 ```json
 {
@@ -202,30 +213,49 @@ below) must be registered on that app in Entra:
         "https://agent365.svc.cloud.microsoft/agents/tenants/YOUR_TENANT_ID/servers/mcp_CalendarTools",
         "51001",
         "--host",
-        "127.0.0.1",
+        "localhost",
         "--callback-path",
         "/",
         "--static-oauth-client-info",
-        "@/Users/you/.config/mcp-remote/client.json",
-        "--skip-issuer-metadata-validation"
+        "{\"client_id\":\"YOUR_ENTRA_CLIENT_ID\"}",
+        "--authorization-server",
+        "https://login.microsoftonline.com/YOUR_TENANT_ID/v2.0"
       ]
     }
   }
 }
 ```
 
-with `client.json` holding the app registration, e.g. `{ "client_id": "YOUR_ENTRA_CLIENT_ID" }`. Most
-MCP clients start the command without a shell, so write the path out in full: `~` and `$HOME` are not
-expanded.
+- **Tenant ID:** use the directory (tenant) ID, a GUID. A domain name such as `contoso.onmicrosoft.com`
+  resolves to the same endpoint, but its metadata names the GUID, so it fails the check.
+- **Client:** Entra ID has no dynamic client registration, so pass the app registration's
+  Application (client) ID with `--static-oauth-client-info`. Inline, as here, the inner quotes are
+  escaped because the JSON sits inside a JSON string. The field is `client_id`, not `clientId`. A
+  client secret is better kept out of the config as a `${VAR}` placeholder, or in a file passed as
+  `@/absolute/path/client.json` (written out in full: most MCP clients start the command without a
+  shell, so `~` and `$HOME` are not expanded).
+- **Redirect URI:** the callback (`http://localhost:51001/` here) must be a redirect URI of that app.
+- **Sandboxed clients:** some MCP clients run local servers in a sandbox that blocks direct
+  connections, DNS lookups included, and lets traffic out only through a proxy named in
+  `HTTPS_PROXY`. There mcp-remote fails with `getaddrinfo ENOTFOUND` until `--enable-proxy` is added.
+  Such a sandbox may not let mcp-remote open a browser either: sign in once from a terminal with the
+  same arguments, and the client picks up the saved tokens.
 
-**Only use this for a server you configured yourself, whose authorization server you trust.** The
-check does not choose the authorization server - protected-resource metadata does, and metadata at
-any URL that names itself passes. What it guarantees is that the issuer everything afterwards is
-compared with - the callback's `iss` (RFC 9207), the issuer stamped on the saved client registration
-and tokens - is the place the metadata really came from. With the flag set, the document's own claim
-is taken instead, so metadata served from one place can claim to be another authorization server:
-the precondition for an authorization server mix-up. The flag applies to every authorization server
-this instance discovers, not just Entra ID, and is not part of the credential cache key.
+#### Skipping the check
+
+`--skip-issuer-metadata-validation` turns that one check off instead, for when no endpoint names
+itself correctly. It is off by default, and nothing else changes: TLS, PKCE, `state`, the RFC 9207
+`iss` check on the callback, and the resource and scope handling all still apply.
+
+**Prefer `--authorization-server` where it works, and otherwise only skip the check for a server you
+configured yourself, whose authorization server you trust.** The check does not choose the
+authorization server - protected-resource metadata does, and metadata at any URL that names itself
+passes. What it guarantees is that the issuer everything afterwards is compared with - the callback's
+`iss` (RFC 9207), the issuer stamped on the saved client registration and tokens - is the place the
+metadata really came from. With the flag set, the document's own claim is taken instead, so metadata
+served from one place can claim to be another authorization server: the precondition for an
+authorization server mix-up. The flag applies to every authorization server this instance discovers,
+not just Entra ID, and is not part of the credential cache key.
 
 ### Flags
 

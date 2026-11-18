@@ -56,6 +56,11 @@ export interface OAuthProviderOptions {
    * servers that publish a templated issuer, such as Entra ID's multi-tenant endpoints.
    */
   skipIssuerMetadataValidation?: boolean
+  /**
+   * Authorization server to sign in at, set by `--authorization-server`, in place of the one the
+   * protected-resource metadata advertises. Its metadata is validated as strictly as any other.
+   */
+  authorizationServer?: string
   /** Extra query parameters to add to the authorization URL, for servers that require their own */
   authorizeParams?: Record<string, string>
   /** Pre-calculated server URL hash for cache isolation */

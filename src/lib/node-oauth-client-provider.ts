@@ -350,6 +350,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
   private skipResourceParameter: boolean
   /** See {@link IssuerMetadataValidationPolicy}. Off unless `--skip-issuer-metadata-validation` is passed. */
   readonly skipIssuerMetadataValidation: boolean
+  /** Set by `--authorization-server`; see {@link discoveryState} for how it reaches the SDK. */
+  private authorizationServerOverride: string | undefined
   /**
    * Overrides how the SDK picks the RFC 8707 `resource` indicator. Only defined when we have
    * an opinion; otherwise the SDK derives it from Protected Resource Metadata as usual.
@@ -410,6 +412,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
     this.authorizeResource = trimmedAuthorizeResource ? trimmedAuthorizeResource : undefined
     this.skipResourceParameter = options.skipResourceParameter ?? false
     this.skipIssuerMetadataValidation = options.skipIssuerMetadataValidation ?? false
+    this.authorizationServerOverride = options.authorizationServer
     this.authorizeParams = options.authorizeParams ?? {}
     this._state = randomUUID()
     this._clientInfo = undefined
@@ -490,6 +493,23 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
       this.discoveryStateFile(this.flowState),
       DiscoveryStateSchema,
     )
+
+    // `--authorization-server`: the SDK signs in at the authorization server a discovery state
+    // names, rather than the first one the protected-resource metadata lists, so naming the chosen
+    // one here is how it gets there. Only the URL is given. The SDK still fetches its metadata and
+    // checks the issuer it publishes against that URL (RFC 8414 §3.3), and still reads the
+    // protected-resource metadata for the resource indicator.
+    //
+    // A flow already under way for that server keeps the state it recorded. On the callback leg
+    // (`incomingState`) nothing is made up: that state is what binds the code to the authorization
+    // server that issued it (SEP-2352), and without it the SDK should refuse, as it otherwise would.
+    if (
+      this.authorizationServerOverride &&
+      this.flowDiscovery?.authorizationServerUrl !== this.authorizationServerOverride &&
+      this.incomingState === undefined
+    ) {
+      this.flowDiscovery = { authorizationServerUrl: this.authorizationServerOverride }
+    }
     return this.flowDiscovery
   }
 
@@ -1188,6 +1208,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
 
       const metadata = await this.getAuthorizationServerMetadata()
       const authorizationServerUrl =
+        this.authorizationServerOverride ??
         (this.protectedResourceMetadata ? getAuthorizationServerUrl(this.protectedResourceMetadata) : undefined) ??
         new URL('/', this.options.serverUrl).toString()
       const resource = await selectResourceURL(new URL(this.resourceServerUrl), this, this.protectedResourceMetadata)

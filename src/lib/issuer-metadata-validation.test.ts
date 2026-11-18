@@ -24,6 +24,10 @@ const templatedIssuer = 'https://login.microsoftonline.com/{tenantid}/v2.0'
 const authorizationEndpoint = 'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize'
 const tokenEndpoint = 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token'
 const serverUrlHash = 'issuer-metadata-validation-test'
+// A tenant's own v2.0 endpoint, which - unlike /organizations - publishes exactly its own URL as the issuer
+const tenantAuthority = 'https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0'
+const tenantAuthorizationEndpoint = 'https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/oauth2/v2.0/authorize'
+const tenantTokenEndpoint = 'https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/oauth2/v2.0/token'
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -32,7 +36,22 @@ const json = (status: number, body: unknown) =>
 class EntraLikeServer {
   issuer = templatedIssuer
   tokenRequests: URLSearchParams[] = []
+  tokenEndpoints: string[] = []
   metadataRequests: string[] = []
+
+  private metadata(issuer: string, authorize: string, token: string) {
+    return json(200, {
+      issuer,
+      authorization_endpoint: authorize,
+      token_endpoint: token,
+      jwks_uri: 'https://login.microsoftonline.com/organizations/discovery/v2.0/keys',
+      response_types_supported: ['code', 'id_token', 'code id_token', 'id_token token'],
+      subject_types_supported: ['pairwise'],
+      id_token_signing_alg_values_supported: ['RS256'],
+      token_endpoint_auth_methods_supported: ['client_secret_post', 'private_key_jwt', 'client_secret_basic'],
+      scopes_supported: ['openid', 'profile', 'email', 'offline_access'],
+    })
+  }
 
   fetch: typeof fetch = async (input, init) => {
     const request = new Request(input, init)
@@ -41,19 +60,14 @@ class EntraLikeServer {
     }
     if (request.url === `${authority}/.well-known/openid-configuration`) {
       this.metadataRequests.push(request.url)
-      return json(200, {
-        issuer: this.issuer,
-        authorization_endpoint: authorizationEndpoint,
-        token_endpoint: tokenEndpoint,
-        jwks_uri: 'https://login.microsoftonline.com/organizations/discovery/v2.0/keys',
-        response_types_supported: ['code', 'id_token', 'code id_token', 'id_token token'],
-        subject_types_supported: ['pairwise'],
-        id_token_signing_alg_values_supported: ['RS256'],
-        token_endpoint_auth_methods_supported: ['client_secret_post', 'private_key_jwt', 'client_secret_basic'],
-        scopes_supported: ['openid', 'profile', 'email', 'offline_access'],
-      })
+      return this.metadata(this.issuer, authorizationEndpoint, tokenEndpoint)
     }
-    if (request.url === tokenEndpoint) {
+    if (request.url === `${tenantAuthority}/.well-known/openid-configuration`) {
+      this.metadataRequests.push(request.url)
+      return this.metadata(tenantAuthority, tenantAuthorizationEndpoint, tenantTokenEndpoint)
+    }
+    if (request.url === tokenEndpoint || request.url === tenantTokenEndpoint) {
+      this.tokenEndpoints.push(request.url)
       this.tokenRequests.push(new URLSearchParams(await request.text()))
       return json(200, { access_token: 'entra-access-token', token_type: 'Bearer', expires_in: 3600 })
     }
@@ -87,9 +101,11 @@ describe('Feature: Authorization server metadata issuer validation (RFC 8414 §3
   })
 
   /** Wired as `connectToRemoteServer` wires it, with an Entra app registration supplied statically. */
-  function instance(skipIssuerMetadataValidation?: boolean) {
+  function instance(skipIssuerMetadataValidation?: boolean, authorizationServer?: string) {
     const authProvider = new NodeOAuthClientProvider({
-      serverUrl: authority,
+      // As `runProxy` passes it: the authorization server discovery settled on
+      serverUrl: authorizationServer ?? authority,
+      authorizationServer,
       resourceServerUrl: serverUrl,
       serverUrlHash,
       host: '127.0.0.1',
@@ -184,5 +200,64 @@ describe('Feature: Authorization server metadata issuer validation (RFC 8414 §3
 
     await expect(connect()).rejects.toMatchObject({ kind: 'metadata', received: 'https://attacker.example.test' })
     expect(redirects).toHaveLength(0)
+  })
+
+  describe('--authorization-server', () => {
+    it('Scenario: Pinned to the tenant, discovery passes the strict check and every request goes to the tenant', async () => {
+      // Without the opt-out: the tenant's endpoint names itself, so nothing needs skipping
+      const { authProvider, connect, redirects, transport } = instance(undefined, tenantAuthority)
+      expect(authProvider.skipIssuerMetadataValidation).toBe(false)
+
+      await expect(connect()).rejects.toThrow(/Unauthorized/)
+
+      // The shared /organizations endpoint the server advertised was never consulted
+      expect(server.metadataRequests).toEqual([`${tenantAuthority}/.well-known/openid-configuration`])
+      expect(redirects).toHaveLength(1)
+      const [authorizationUrl] = redirects
+      expect(`${authorizationUrl.origin}${authorizationUrl.pathname}`).toBe(tenantAuthorizationEndpoint)
+      expect(authorizationUrl.searchParams.get('code_challenge_method')).toBe('S256')
+      expect(authorizationUrl.searchParams.get('state')).toBeTruthy()
+      // The resource indicator still comes from the server's protected-resource metadata
+      expect(authorizationUrl.searchParams.get('resource')).toBe(serverUrl)
+
+      // And the code is redeemed at the tenant's token endpoint, with the verifier
+      authProvider.useAuthorizationState(authorizationUrl.searchParams.get('state')!)
+      await transport.finishAuth('tenant-code')
+      expect(server.tokenEndpoints).toEqual([tenantTokenEndpoint])
+      expect(server.tokenRequests[0].get('code_verifier')).toMatch(/^[A-Za-z0-9._~-]{43,128}$/)
+    })
+
+    it('Scenario: A callback from another issuer is still refused when pinned (RFC 9207)', async () => {
+      const { authProvider, connect, redirects, transport } = instance(undefined, tenantAuthority)
+      await expect(connect()).rejects.toThrow(/Unauthorized/)
+      authProvider.useAuthorizationState(redirects[0].searchParams.get('state')!)
+
+      await expect(transport.finishAuth('stolen-code', templatedIssuer)).rejects.toMatchObject({ kind: 'authorization_response' })
+      expect(server.tokenRequests).toHaveLength(0)
+    })
+
+    it('Scenario: Pinning to a server whose metadata names someone else still fails the issuer check', async () => {
+      // The pinned server is checked like any other: here, the shared endpoint with its template
+      const { connect, redirects } = instance(undefined, authority)
+
+      await expect(connect()).rejects.toMatchObject({ kind: 'metadata', expected: authority, received: templatedIssuer })
+      expect(redirects).toHaveLength(0)
+    })
+
+    it('Scenario: The callback leg is not given a made-up discovery state', async () => {
+      const { authProvider } = instance(undefined, tenantAuthority)
+
+      // Starting a sign-in, the SDK is pointed at the pinned server
+      expect(await authProvider.discoveryState()).toEqual({ authorizationServerUrl: tenantAuthority })
+
+      // A callback for a flow with nothing on record is left for the SDK to refuse (SEP-2352)
+      authProvider.useAuthorizationState('flow-with-no-record')
+      expect(await authProvider.discoveryState()).toBeUndefined()
+    })
+
+    it('Scenario: Without the option, the SDK is left to discover the advertised server as before', async () => {
+      const { authProvider } = instance()
+      expect(await authProvider.discoveryState()).toBeUndefined()
+    })
   })
 })

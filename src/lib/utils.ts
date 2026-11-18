@@ -1886,12 +1886,16 @@ export interface OAuthServerDiscoveryResult {
  *
  * @param serverUrl The MCP server URL
  * @param headers Optional headers to include in the probe request
+ * @param tokenEndpoint Explicit client_credentials token endpoint; skips discovery entirely
+ * @param authorizationServer Authorization server set by `--authorization-server`, used in place
+ *   of the one the protected-resource metadata advertises. That metadata is still read, for scopes.
  * @returns Discovery result with authorization server URL and metadata
  */
 export async function discoverOAuthServerInfo(
   serverUrl: string,
   headers: Record<string, string> = {},
   tokenEndpoint?: string,
+  authorizationServer?: string,
 ): Promise<OAuthServerDiscoveryResult> {
   // Machine-to-machine deployments sometimes have a token endpoint that is known to the
   // operator but publish neither RFC 9728 protected-resource metadata nor RFC 8414/OIDC
@@ -1934,9 +1938,10 @@ export async function discoverOAuthServerInfo(
     // Fall back to using serverUrl as authorization server
     if (response.ok) {
       debugLog('Server responded OK without auth, using server URL as authorization server')
-      const authServerMetadata = await fetchAuthorizationServerMetadata(serverUrl)
+      const authorizationServerUrl = authorizationServer ?? serverUrl
+      const authServerMetadata = await fetchAuthorizationServerMetadata(authorizationServerUrl)
       return {
-        authorizationServerUrl: serverUrl,
+        authorizationServerUrl,
         authorizationServerMetadata: authServerMetadata,
       }
     }
@@ -1986,6 +1991,11 @@ export async function discoverOAuthServerInfo(
     debugLog('No Protected Resource Metadata found, falling back to server URL as authorization server')
   }
 
+  if (authorizationServer) {
+    noteAuthorizationServerOverride(authorizationServer, protectedResourceMetadata?.authorization_servers ?? [])
+    authorizationServerUrl = authorizationServer
+  }
+
   // Step 4: Fetch Authorization Server Metadata
   const authorizationServerMetadata = await fetchAuthorizationServerMetadata(authorizationServerUrl)
 
@@ -1994,6 +2004,41 @@ export async function discoverOAuthServerInfo(
     authorizationServerMetadata,
     protectedResourceMetadata,
     wwwAuthenticateScope,
+  }
+}
+
+/**
+ * Says where `--authorization-server` sends the sign-in, against what the server advertised.
+ *
+ * Choosing an authorization server the server never named is the user's call to make, so it is not
+ * refused - but one on another host altogether is worth a warning, since nothing the server said
+ * vouches for it. A server on the advertised host (another tenant path of the same identity
+ * provider, typically) is reported plainly.
+ */
+function noteAuthorizationServerOverride(authorizationServer: string, advertised: string[]): void {
+  if (advertised.includes(authorizationServer)) {
+    debugLog('--authorization-server names an authorization server the server advertises', { authorizationServer })
+    return
+  }
+  if (advertised.length === 0) {
+    log(`Signing in at ${authorizationServer} (--authorization-server); the server advertised no authorization server`)
+    return
+  }
+
+  const host = new URL(authorizationServer).host
+  const sameHost = advertised.some((url) => {
+    try {
+      return new URL(url).host === host
+    } catch {
+      return false
+    }
+  })
+  if (sameHost) {
+    log(`Signing in at ${authorizationServer} (--authorization-server) instead of ${advertised.join(', ')}, which the server advertises`)
+  } else {
+    log(
+      `Warning: --authorization-server ${authorizationServer} is not on the host of any authorization server the server advertises (${advertised.join(', ')}). Use it only if you trust it to sign you in to this server.`,
+    )
   }
 }
 
@@ -2887,6 +2932,32 @@ async function readHeaderFile(filePath: string): Promise<Record<string, string>>
   return headers
 }
 
+/**
+ * Validates an `--authorization-server` value: an issuer identifier, so HTTPS with no query,
+ * fragment or credentials (RFC 8414 §2), with plain HTTP allowed only on loopback for local servers.
+ *
+ * The value is returned as given rather than normalised. The SDK compares it with the `issuer` the
+ * metadata publishes character for character, and `new URL()` would add a trailing slash to a bare
+ * origin that the issuer may not have.
+ */
+function parseAuthorizationServerArg(value: string): string {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error(`Invalid --authorization-server value: "${value}". Expected an HTTPS URL, e.g. https://login.example.com/tenant`)
+  }
+
+  const isLoopback = url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]')
+  if (url.protocol !== 'https:' && !isLoopback) {
+    throw new Error('--authorization-server must use HTTPS, except for an HTTP loopback server')
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error('--authorization-server must not contain credentials, a query string or a fragment')
+  }
+  return value
+}
+
 export async function parseCommandLineArgs(args: string[], usage: string) {
   if (args.includes('--help') || args.includes('-h')) {
     process.stdout.write(`${usage}\n`)
@@ -3192,6 +3263,24 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     log(`Using an explicit OAuth token endpoint at ${endpoint.origin}`)
   }
 
+  // Sign in at this authorization server rather than the one the server's protected-resource
+  // metadata advertises. Its metadata is still validated as strictly as any other (RFC 8414
+  // §3.3), which is the point: Entra ID's shared /organizations endpoint publishes a templated
+  // issuer that cannot pass, while a tenant's own endpoint names itself exactly.
+  let authorizationServer: string | undefined
+  const authorizationServerIndex = args.indexOf('--authorization-server')
+  if (authorizationServerIndex !== -1) {
+    const value = args[authorizationServerIndex + 1]
+    if (value === undefined || value.startsWith('--')) {
+      throw new Error('--authorization-server requires an HTTPS URL')
+    }
+    if (tokenEndpoint) {
+      throw new Error('--authorization-server cannot be combined with --token-endpoint, which skips authorization server discovery')
+    }
+    authorizationServer = parseAuthorizationServerArg(value.trim())
+    log(`Signing in at the authorization server set by --authorization-server: ${authorizationServer}`)
+  }
+
   // Both finish inside the provider's redirect step, so neither has a code arriving at a port
   NON_INTERACTIVE_FLOW = useDeviceCode || useClientCredentials
 
@@ -3301,7 +3390,15 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   }
 
   // Calculate hash with all parsed parameters for cache isolation
-  const serverUrlHash = getServerUrlHash(serverUrl, authorizeResource, headers, authorizeParams, clientMetadataUrl, tokenEndpoint)
+  const serverUrlHash = getServerUrlHash(
+    serverUrl,
+    authorizeResource,
+    headers,
+    authorizeParams,
+    clientMetadataUrl,
+    tokenEndpoint,
+    authorizationServer,
+  )
 
   // Set server hash globally for debug logging
   global.currentServerUrlHash = serverUrlHash
@@ -3356,6 +3453,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     authorizeResource,
     skipResourceParameter,
     skipIssuerMetadataValidation,
+    authorizationServer,
     authorizeParams,
     ignoredTools,
     authTimeoutMs,
@@ -3397,6 +3495,7 @@ export function setupSignalHandlers(cleanup: () => Promise<void>) {
  * @param authorizeParams Optional extra authorization parameters
  * @param clientMetadataUrl Optional Client ID Metadata Document URL used as the client_id
  * @param tokenEndpoint Optional explicit token endpoint used by the client_credentials grant
+ * @param authorizationServer Optional authorization server set by `--authorization-server`
  * @returns MD5 hash of the configuration
  */
 export function getServerUrlHash(
@@ -3406,6 +3505,7 @@ export function getServerUrlHash(
   authorizeParams?: Record<string, string>,
   clientMetadataUrl?: string,
   tokenEndpoint?: string,
+  authorizationServer?: string,
 ): string {
   // Include resource and headers in hash to isolate OAuth sessions
   // per unique server configuration (fixes #25)
@@ -3429,6 +3529,9 @@ export function getServerUrlHash(
   // Client credentials and tokens are bound to the authorization server that issued them. A
   // changed endpoint must never inherit a token cached for the same MCP resource server.
   if (tokenEndpoint) parts.push(tokenEndpoint)
+  // Likewise for a chosen authorization server. Tagged, so it cannot collide with another URL-valued
+  // part, and absent unless set, so every existing cache keeps its key.
+  if (authorizationServer) parts.push(`authorization-server=${authorizationServer}`)
   return crypto.createHash('md5').update(parts.join('|')).digest('hex')
 }
 

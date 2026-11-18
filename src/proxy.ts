@@ -57,6 +57,7 @@ async function runProxy(
   authorizeResource: string | undefined,
   skipResourceParameter: boolean,
   skipIssuerMetadataValidation: boolean,
+  authorizationServer: string | undefined,
   authorizeParams: Record<string, string>,
   ignoredTools: string[],
   authTimeoutMs: number,
@@ -88,7 +89,7 @@ async function runProxy(
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
   log('Discovering OAuth server configuration...')
-  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers, tokenEndpoint)
+  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers, tokenEndpoint, authorizationServer)
 
   if (discoveryResult.protectedResourceMetadata) {
     log(`Discovered authorization server: ${discoveryResult.authorizationServerUrl}`)
@@ -120,6 +121,7 @@ async function runProxy(
     authorizeResource,
     skipResourceParameter,
     skipIssuerMetadataValidation,
+    authorizationServer,
     authorizeParams,
     serverUrlHash,
     authorizationServerMetadata: discoveryResult.authorizationServerMetadata,
@@ -319,6 +321,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
       authorizeResource,
       skipResourceParameter,
       skipIssuerMetadataValidation,
+      authorizationServer,
       authorizeParams,
       ignoredTools,
       authTimeoutMs,
@@ -346,6 +349,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote <https://server-u
         authorizeResource,
         skipResourceParameter,
         skipIssuerMetadataValidation,
+        authorizationServer,
         authorizeParams,
         ignoredTools,
         authTimeoutMs,
