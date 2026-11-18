@@ -3248,6 +3248,17 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     log(usage)
     process.exit(1)
   }
+  if (Object.keys(headers).length > 0) {
+    // Names only - values routinely carry bearer tokens and API keys, and this
+    // goes to stderr, which MCP clients capture into their own logs.
+    log(`Using custom headers: ${Object.keys(headers).join(', ')}`)
+  }
+  // Replace environment variables in headers
+  // example `Authorization: Bearer ${TOKEN}` will read process.env.TOKEN
+  for (const [key, value] of Object.entries(headers)) {
+    headers[key] = substituteEnvVars(value, `header '${key}'`)
+  }
+
   // Calculate hash with all parsed parameters for cache isolation
   const serverUrlHash = getServerUrlHash(serverUrl, authorizeResource, headers, authorizeParams, clientMetadataUrl, tokenEndpoint)
 
@@ -3281,17 +3292,6 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   // Static client info is pinned by the user, so it is never discarded.
   if (!staticOAuthClientInfo) {
     await invalidateMismatchedClientRegistration(serverUrlHash, buildRedirectUrl(host, callbackPort, callbackPath))
-  }
-
-  if (Object.keys(headers).length > 0) {
-    // Names only - values routinely carry bearer tokens and API keys, and this
-    // goes to stderr, which MCP clients capture into their own logs.
-    log(`Using custom headers: ${Object.keys(headers).join(', ')}`)
-  }
-  // Replace environment variables in headers
-  // example `Authorization: Bearer ${TOKEN}` will read process.env.TOKEN
-  for (const [key, value] of Object.entries(headers)) {
-    headers[key] = substituteEnvVars(value, `header '${key}'`)
   }
 
   return {
