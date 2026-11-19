@@ -324,6 +324,21 @@ describe('Feature: Command Line Arguments Parsing', () => {
     })
   })
 
+  it('Scenario: Isolate credentials by the expanded values of custom headers', async () => {
+    vi.stubEnv('MCP_TEST_TENANT', 'tenant-a')
+    const tenantA = await parseCommandLineArgs(['https://example.com/sse', '--header', 'X-Tenant: ${MCP_TEST_TENANT}'], 'test usage')
+
+    vi.stubEnv('MCP_TEST_TENANT', 'tenant-b')
+    const tenantB = await parseCommandLineArgs(['https://example.com/sse', '--header', 'X-Tenant: ${MCP_TEST_TENANT}'], 'test usage')
+    const literalA = await parseCommandLineArgs(['https://example.com/sse', '--header', 'X-Tenant: tenant-a'], 'test usage')
+
+    expect(tenantA.headers).toEqual({ 'X-Tenant': 'tenant-a' })
+    expect(tenantB.headers).toEqual({ 'X-Tenant': 'tenant-b' })
+    expect(tenantA.serverUrlHash).not.toBe(tenantB.serverUrlHash)
+    expect(tenantA.serverUrlHash).toBe(literalA.serverUrlHash)
+    vi.unstubAllEnvs()
+  })
+
   it('Scenario: Never log custom header values', async () => {
     // Given a header carrying a secret
     const logSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
