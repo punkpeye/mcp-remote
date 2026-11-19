@@ -4538,6 +4538,109 @@ describe('Feature: Stale Client Registration Invalidation', () => {
     expect(fs.existsSync(clientInfoPath(serverUrl))).toBe(false)
   })
 
+  it('Scenario: Keep a loopback registration the authorization server returned without a port', async () => {
+    // Given a registration whose redirect_uri came back without the port it was registered with,
+    // as a Keycloak server was seen to return it (#393). Keycloak accepts that URI on any port, so the registration still
+    // works, and dropping it would lose the client the refresh token belongs to.
+    const serverUrl = 'https://portless.example.com/mcp'
+    const defaultHost = process.platform === 'win32' ? '127.0.0.1' : 'localhost'
+    writeRegistration(serverUrl, [`http://${defaultHost}/oauth/callback`])
+
+    // When starting on the derived port
+    const result = await parseCommandLineArgs([serverUrl], 'test usage')
+
+    // Then the registration is kept
+    expect(result.callbackPort).toBe(calculateDefaultPort(getServerUrlHash(serverUrl)))
+    expect(fs.existsSync(clientInfoPath(serverUrl))).toBe(true)
+  })
+
+  it('Scenario: Keep a port-less registration when a port is given on the command line', async () => {
+    // Given a port-less loopback registration
+    const serverUrl = 'https://portless-explicit.example.com/mcp'
+    writeRegistration(serverUrl, ['http://localhost/oauth/callback'])
+
+    // When a port is demanded
+    const result = await parseCommandLineArgs([serverUrl, '7788', '--host', 'localhost'], 'test usage')
+
+    // Then the registration is kept - it names no port to conflict with
+    expect(result.callbackPort).toBe(7788)
+    expect(fs.existsSync(clientInfoPath(serverUrl))).toBe(true)
+  })
+
+  it('Scenario: Keep a port-less registration on the IPv4 and IPv6 loopback addresses', async () => {
+    for (const host of ['127.0.0.1', '[::1]']) {
+      // Given a port-less registration on that loopback address
+      const serverUrl = `https://portless-${host.replace(/\W/g, '')}.example.com/mcp`
+      writeRegistration(serverUrl, [`http://${host}/oauth/callback`])
+
+      // When starting with it as the callback host
+      await parseCommandLineArgs([serverUrl, '--host', host], 'test usage')
+
+      // Then the registration is kept
+      expect(fs.existsSync(clientInfoPath(serverUrl))).toBe(true)
+    }
+  })
+
+  it('Scenario: Keep a port-less entry among other redirect_uris, on a custom callback path', async () => {
+    // Given a registration listing an unrelated URI and a port-less one on a custom path
+    const serverUrl = 'https://portless-list.example.com/mcp'
+    writeRegistration(serverUrl, ['https://proxy.example.com/oauth/callback', 'http://localhost/cb'])
+
+    // When starting with that callback path
+    await parseCommandLineArgs([serverUrl, '--host', 'localhost', '--callback-path', '/cb'], 'test usage')
+
+    // Then the registration is kept
+    expect(fs.existsSync(clientInfoPath(serverUrl))).toBe(true)
+  })
+
+  it('Scenario: A port-less registration must still match the callback host and path', async () => {
+    // Given port-less registrations that differ from this run's redirect_uri in host, in how the
+    // host is written, or in path
+    const hostChange = 'https://portless-host.example.com/mcp'
+    writeRegistration(hostChange, ['http://localhost/oauth/callback'])
+    const hostSpelling = 'https://portless-spelling.example.com/mcp'
+    writeRegistration(hostSpelling, ['http://localhost/oauth/callback'])
+    const pathChange = 'https://portless-path.example.com/mcp'
+    writeRegistration(pathChange, ['http://localhost/oauth/callback'])
+
+    // When each is started with the differing callback host or path
+    await parseCommandLineArgs([hostChange, '--host', '127.0.0.1'], 'test usage')
+    await parseCommandLineArgs([hostSpelling, '--host', 'LOCALHOST'], 'test usage')
+    await parseCommandLineArgs([pathChange, '--host', 'localhost', '--callback-path', '/custom-callback'], 'test usage')
+
+    // Then all are discarded - only the port may differ
+    expect(fs.existsSync(clientInfoPath(hostChange))).toBe(false)
+    expect(fs.existsSync(clientInfoPath(hostSpelling))).toBe(false)
+    expect(fs.existsSync(clientInfoPath(pathChange))).toBe(false)
+  })
+
+  it('Scenario: Only a loopback redirect_uri may leave the port out', async () => {
+    // Given a port-less registration for a callback host that is not loopback, where a URI without
+    // a port means port 80
+    const serverUrl = 'https://portless-remote.example.com/mcp'
+    writeRegistration(serverUrl, ['http://callback.example.com/oauth/callback'])
+
+    // When starting with that callback host
+    await parseCommandLineArgs([serverUrl, '--host', 'callback.example.com'], 'test usage')
+
+    // Then the registration is discarded, as before
+    expect(fs.existsSync(clientInfoPath(serverUrl))).toBe(false)
+  })
+
+  it('Scenario: A registration that names port 80 is held to port 80', async () => {
+    // Given a loopback registration with an explicit :80 - it names a port, so it is not the
+    // port-less form, even though port 80 is the default for http
+    const serverUrl = 'https://explicit80.example.com/mcp'
+    writeRegistration(serverUrl, ['http://localhost:80/oauth/callback'])
+
+    // When starting on another port
+    const result = await parseCommandLineArgs([serverUrl, '7788', '--host', 'localhost'], 'test usage')
+
+    // Then the registration is discarded, like any other port mismatch
+    expect(result.callbackPort).toBe(7788)
+    expect(fs.existsSync(clientInfoPath(serverUrl))).toBe(false)
+  })
+
   it('Scenario: Never discard a user-pinned static client registration', async () => {
     // Given a registration that does not match, but static client info was supplied
     const serverUrl = 'https://static.example.com/mcp'

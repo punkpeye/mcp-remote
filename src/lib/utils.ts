@@ -2674,19 +2674,35 @@ export function formatHostForUrl(address: string): string {
 /**
  * Builds the OAuth redirect URI for a given host/port. Kept in one place because the value
  * registered with the authorization server and the value checked against a cached
- * registration must match exactly - see invalidateMismatchedClientRegistration.
+ * registration must match - see invalidateMismatchedClientRegistration.
  */
 export function buildRedirectUrl(host: string, port: number, callbackPath: string = DEFAULT_CALLBACK_PATH): string {
   return `http://${host}:${port}${callbackPath}`
 }
 
+/** Callback hosts whose cached registration may leave the port out of its redirect_uri. */
+const LOOPBACK_CALLBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
+
 /**
  * Deletes a cached client registration whose redirect_uris do not include the redirect URI
  * this session will send, forcing a fresh dynamic registration on the next request.
+ *
+ * For a loopback callback host, the same URI without a port also counts. Keycloak has been seen
+ * to return a loopback redirect_uri without the port it was registered with, and it then accepts
+ * that URI on any port, much as RFC 8252 §7.3 asks of loopback IP literals. A port-less entry
+ * cannot name the wrong port, so dropping it would only lose the refresh token's client.
  */
-async function invalidateMismatchedClientRegistration(serverUrlHash: string, redirectUrl: string): Promise<void> {
+async function invalidateMismatchedClientRegistration(
+  serverUrlHash: string,
+  host: string,
+  port: number,
+  callbackPath: string,
+): Promise<void> {
+  const redirectUrl = buildRedirectUrl(host, port, callbackPath)
+  // Built from the same parts, so it differs from redirectUrl in the port alone
+  const portlessRedirectUrl = LOOPBACK_CALLBACK_HOSTS.has(host) ? `http://${host}${callbackPath}` : undefined
   const clientInfo = await readJsonFile<OAuthClientInformationFull>(serverUrlHash, 'client_info.json', OAuthClientInformationFullSchema)
-  if (!clientInfo || clientInfo.redirect_uris.includes(redirectUrl)) {
+  if (!clientInfo || clientInfo.redirect_uris.some((uri) => uri === redirectUrl || uri === portlessRedirectUrl)) {
     return
   }
 
@@ -3276,11 +3292,13 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   // authorize request (RFC 6749 §3.1.2.4) and, because it refuses to redirect back, the user
   // sees an opaque error at the AS rather than anything actionable here. Worse, the callback
   // port is re-picked on each run, so it never self-heals. Dropping the registration lets the
-  // next request re-register cleanly.
+  // next request re-register cleanly. The one exception is a loopback redirect_uri the
+  // authorization server stored without a port, which cannot name the wrong port - see
+  // invalidateMismatchedClientRegistration.
   //
   // Static client info is pinned by the user, so it is never discarded.
   if (!staticOAuthClientInfo) {
-    await invalidateMismatchedClientRegistration(serverUrlHash, buildRedirectUrl(host, callbackPort, callbackPath))
+    await invalidateMismatchedClientRegistration(serverUrlHash, host, callbackPort, callbackPath)
   }
 
   if (Object.keys(headers).length > 0) {
