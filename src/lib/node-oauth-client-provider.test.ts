@@ -1941,6 +1941,7 @@ describe('NodeOAuthClientProvider - scope on refresh_token grants (Entra AADSTS9
   })
 
   afterEach(() => {
+    vi.unstubAllGlobals()
     vi.clearAllMocks()
   })
 
@@ -2032,6 +2033,168 @@ describe('NodeOAuthClientProvider - scope on refresh_token grants (Entra AADSTS9
 
     expect(mockRefresh).toHaveBeenCalledTimes(1)
     expect(mockRefresh.mock.calls[0][1].addClientAuthentication).toBe(provider.addClientAuthentication)
+  })
+
+  describe('a server that refuses the scope on a refresh', () => {
+    const tokenEndpoint = 'https://as.example.com/token'
+    const json = (status: number, body: unknown) =>
+      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    const issued = { access_token: 'at-2', refresh_token: 'rt-2', token_type: 'Bearer', expires_in: 3600 }
+
+    /** Builds the refresh request the way the SDK does: the hook runs over the bare grant. */
+    const sdkRefresh = async (provider: NodeOAuthClientProvider): Promise<RequestInit> => {
+      const headers = new Headers({ 'Content-Type': 'application/x-www-form-urlencoded' })
+      const params = tokenRequest('refresh_token', { refresh_token: 'rt-1' })
+      await provider.addClientAuthentication(headers, params, tokenEndpoint, undefined)
+      return { method: 'POST', headers, body: params }
+    }
+
+    const bodyOf = (call: unknown[]) => (call[1] as RequestInit).body as URLSearchParams
+
+    // Salesforce answers any refresh that carries `scope` with invalid_request, before it looks at the token
+    const salesforce = () =>
+      vi.fn(async (_url: unknown, init?: RequestInit) =>
+        (init!.body as URLSearchParams).has('scope')
+          ? json(400, { error: 'invalid_request', error_description: 'scope parameter not supported' })
+          : json(200, issued),
+      )
+
+    // Entra answers a refresh that carries no scope with AADSTS90009, which is also a 400 invalid_request
+    const entra = () =>
+      vi.fn(async (_url: unknown, init?: RequestInit) =>
+        (init!.body as URLSearchParams).has('scope')
+          ? json(200, issued)
+          : json(400, { error: 'invalid_request', error_description: 'AADSTS90009: requesting a token for itself' }),
+      )
+
+    it('Scenario: the SDK refresh is sent again without scope, and succeeds (issue #396)', async () => {
+      const provider = new NodeOAuthClientProvider({
+        ...options,
+        staticOAuthClientMetadata: { scope: 'mcp_api refresh_token offline_access' } as any,
+      })
+      const endpoint = salesforce()
+
+      const response = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({ access_token: 'at-2' })
+      expect(endpoint).toHaveBeenCalledTimes(2)
+      expect(bodyOf(endpoint.mock.calls[0]).get('scope')).toBe('mcp_api refresh_token offline_access')
+      // Everything but the scope is what the first attempt sent
+      expect(bodyOf(endpoint.mock.calls[1]).has('scope')).toBe(false)
+      expect(bodyOf(endpoint.mock.calls[1]).get('refresh_token')).toBe('rt-1')
+      expect(bodyOf(endpoint.mock.calls[1]).get('client_id')).toBe('c1')
+    })
+
+    it('Scenario: once refused, later refreshes leave the scope off without asking again', async () => {
+      const provider = new NodeOAuthClientProvider({
+        ...options,
+        staticOAuthClientMetadata: { scope: 'mcp_api refresh_token offline_access' } as any,
+      })
+      const endpoint = salesforce()
+      await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+      endpoint.mockClear()
+
+      const response = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      expect(response.status).toBe(200)
+      expect(endpoint).toHaveBeenCalledTimes(1)
+      expect(bodyOf(endpoint.mock.calls[0]).has('scope')).toBe(false)
+    })
+
+    it('Scenario: the proactive refresh is sent again without scope, and succeeds', async () => {
+      withClient(
+        { client_id: 'c1', redirect_uris: [] },
+        { access_token: 'stale', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, expires_at: Date.now() - 1000 },
+      )
+      const provider = new NodeOAuthClientProvider({
+        ...options,
+        staticOAuthClientMetadata: { scope: 'mcp_api refresh_token offline_access' } as any,
+      })
+      const endpoint = salesforce()
+      // Stands in for the SDK's refreshAuthorization: build the request with the hook, send it with the fetch it was given
+      mockRefresh.mockImplementation(async (_url: unknown, { fetchFn }: any) => {
+        const response = await fetchFn(tokenEndpoint, await sdkRefresh(provider))
+        return response.json()
+      })
+      vi.stubGlobal('fetch', endpoint)
+
+      const refreshed = await provider.tokens()
+
+      expect(refreshed?.access_token).toBe('at-2')
+      expect(endpoint).toHaveBeenCalledTimes(2)
+      expect(bodyOf(endpoint.mock.calls[1]).has('scope')).toBe(false)
+    })
+
+    it('Scenario: the proactive refresh goes out on the global fetch, not the one that carries the MCP headers', async () => {
+      withClient(
+        { client_id: 'c1', redirect_uris: [] },
+        { access_token: 'stale', refresh_token: 'rt-1', token_type: 'Bearer', expires_in: 3600, expires_at: Date.now() - 1000 },
+      )
+      const mcpFetch = vi.fn(async () => json(200, issued))
+      const provider = new NodeOAuthClientProvider({ ...options, fetchFn: mcpFetch as any })
+      const endpoint = vi.fn(async () => json(200, issued))
+      mockRefresh.mockImplementation(async (_url: unknown, { fetchFn }: any) =>
+        (await fetchFn(tokenEndpoint, await sdkRefresh(provider))).json(),
+      )
+      vi.stubGlobal('fetch', endpoint)
+
+      await provider.tokens()
+
+      // --header values (Authorization, API keys) belong to the MCP server, not to the authorization server
+      expect(endpoint).toHaveBeenCalledTimes(1)
+      expect(mcpFetch).not.toHaveBeenCalled()
+    })
+
+    it('Scenario: a retry the server refuses too leaves the scope on later refreshes', async () => {
+      const provider = new NodeOAuthClientProvider({ ...options, staticOAuthClientMetadata: { scope: 'openid api://app/read' } as any })
+      const endpoint = vi.fn(async () => json(400, { error: 'invalid_request' }))
+
+      const response = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      // Both requests were refused, so the refusal was not about the scope; the retry's answer is the one returned
+      expect(response.status).toBe(400)
+      expect(endpoint).toHaveBeenCalledTimes(2)
+      expect(bodyOf(endpoint.mock.calls[1]).has('scope')).toBe(false)
+      expect(((await sdkRefresh(provider)).body as URLSearchParams).get('scope')).toBe('openid api://app/read')
+    })
+
+    it('Scenario: a server that needs the scope, as Entra does, still gets it and is asked once', async () => {
+      const provider = new NodeOAuthClientProvider({ ...options, staticOAuthClientMetadata: { scope: 'openid api://app/read' } as any })
+      const endpoint = entra()
+
+      const response = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      expect(response.status).toBe(200)
+      expect(endpoint).toHaveBeenCalledTimes(1)
+      expect(bodyOf(endpoint.mock.calls[0]).get('scope')).toBe('openid api://app/read')
+      // Nothing was refused, so nothing is remembered
+      expect((await sdkRefresh(provider)).body).toSatisfy((body: URLSearchParams) => body.get('scope') === 'openid api://app/read')
+    })
+
+    it('Scenario: an invalid_request that is not about the scope is not retried when no scope was sent', async () => {
+      const provider = new NodeOAuthClientProvider({
+        ...options,
+        protectedResourceMetadata: { resource: 'https://example.com', scopes_supported: [] } as any,
+      })
+      const endpoint = vi.fn(async () => json(400, { error: 'invalid_request' }))
+
+      const response = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      expect(response.status).toBe(400)
+      expect(endpoint).toHaveBeenCalledTimes(1)
+    })
+
+    it('Scenario: a refusal other than invalid_request is passed on as it came', async () => {
+      const provider = new NodeOAuthClientProvider({ ...options, staticOAuthClientMetadata: { scope: 'openid' } as any })
+      const endpoint = vi.fn(async () => json(400, { error: 'invalid_grant' }))
+
+      const response = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      expect(response.status).toBe(400)
+      await expect(response.json()).resolves.toMatchObject({ error: 'invalid_grant' })
+      expect(endpoint).toHaveBeenCalledTimes(1)
+    })
   })
 })
 
