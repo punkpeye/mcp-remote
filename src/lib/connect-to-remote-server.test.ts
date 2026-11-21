@@ -16,6 +16,8 @@ const mockState = vi.hoisted(() => ({
   // Every authorization code handed to `finishAuth`, in order.
   finishAuthCalls: [] as string[],
   finishAuthGate: null as (() => Promise<void>) | null,
+  // The options every transport (HTTP and SSE) was constructed with, in order.
+  transportOptions: [] as Array<{ kind: 'http' | 'sse'; opts: { skipIssuerMetadataValidation?: boolean } }>,
 }))
 
 vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
@@ -50,6 +52,7 @@ vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
       public opts: unknown,
     ) {
       mockState.httpTransports.push(this)
+      mockState.transportOptions.push({ kind: 'http', opts: opts as { skipIssuerMetadataValidation?: boolean } })
     }
   }
   class SSEClientTransport {
@@ -59,7 +62,9 @@ vi.mock('@modelcontextprotocol/client', async (importOriginal) => {
     constructor(
       public url: URL,
       public opts: unknown,
-    ) {}
+    ) {
+      mockState.transportOptions.push({ kind: 'sse', opts: opts as { skipIssuerMetadataValidation?: boolean } })
+    }
   }
   class Client {
     constructor(
@@ -92,6 +97,7 @@ describe('connectToRemoteServer', () => {
     mockState.httpTransports.length = 0
     mockState.finishAuthCalls.length = 0
     mockState.finishAuthGate = null
+    mockState.transportOptions.length = 0
     mockState.connectFailuresRemaining = 1
     mockState.rejectedTokenFailuresRemaining = 0
     // Keep test output quiet; connectToRemoteServer logs to stderr.
@@ -372,5 +378,65 @@ describe('connectToRemoteServer', () => {
     )
 
     expect(mockState.finishAuthCalls).toEqual(['auth-code-789'])
+  })
+
+  describe('issuer metadata validation (RFC 8414 §3.3)', () => {
+    const signedIn = () =>
+      vi.fn().mockResolvedValue({
+        waitForAuthCode: async () => ({ code: 'auth-code-issuer' }),
+        skipBrowserAuth: false,
+      })
+
+    it('keeps validation on every transport when the provider does not opt out', async () => {
+      // Proxy mode over HTTP: main transport, probe transport, and the pair rebuilt after sign-in
+      await connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, signedIn(), 'http-first')
+
+      expect(mockState.transportOptions.length).toBeGreaterThanOrEqual(2)
+      for (const { opts } of mockState.transportOptions) expect(opts.skipIssuerMetadataValidation).toBe(false)
+    })
+
+    it('ignores anything but an explicit true from the provider', async () => {
+      await connectToRemoteServer(
+        null,
+        'https://mcp.example.com/mcp',
+        { skipIssuerMetadataValidation: 'yes' } as any,
+        {},
+        signedIn(),
+        'http-first',
+      )
+
+      for (const { opts } of mockState.transportOptions) expect(opts.skipIssuerMetadataValidation).toBe(false)
+    })
+
+    it('hands the opt-out to the HTTP transport and the probe that receives the 401', async () => {
+      await connectToRemoteServer(
+        null,
+        'https://mcp.example.com/mcp',
+        { skipIssuerMetadataValidation: true } as any,
+        {},
+        signedIn(),
+        'http-first',
+      )
+
+      // The probe is the transport whose 401 runs discovery and whose finishAuth redeems the code
+      expect(mockState.transportOptions.length).toBeGreaterThanOrEqual(2)
+      for (const { kind, opts } of mockState.transportOptions) {
+        expect(kind).toBe('http')
+        expect(opts.skipIssuerMetadataValidation).toBe(true)
+      }
+    })
+
+    it('hands the opt-out to the SSE transport', async () => {
+      await connectToRemoteServer(
+        null,
+        'https://mcp.example.com/sse',
+        { skipIssuerMetadataValidation: true } as any,
+        {},
+        signedIn(),
+        'sse-only',
+      )
+
+      expect(mockState.transportOptions).toEqual([{ kind: 'sse', opts: expect.objectContaining({ skipIssuerMetadataValidation: true }) }])
+    })
   })
 })
