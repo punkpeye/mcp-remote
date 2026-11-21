@@ -1584,13 +1584,33 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
     this.applyScope(authorizationUrl)
     this.applyAuthorizeParams(authorizationUrl)
 
-    log(`\nPlease authorize this client by visiting:\n${authorizationUrl.toString()}\n`)
-
-    debugLog('Redirecting to authorization URL', authorizationUrl.toString())
-
     await this.preflightCachedDynamicClientRegistration(authorizationUrl)
 
     this.guardAgainstAuthorizationStorm()
+
+    // Everything that can still refuse the redirect has been checked; from here the URL is handed
+    // to a browser, and the code it comes back with is only worth anything if something is already
+    // listening on the callback port named in it. The SDK calls this from inside its own 401
+    // handler, i.e. before the code that owns the callback server has heard about the refused
+    // request, so that server has to be started from here.
+    if (this.options.ensureCallbackServer) {
+      try {
+        const { skipBrowserAuth } = await this.options.ensureCallbackServer()
+        if (skipBrowserAuth) {
+          log('Another instance is running the sign-in for this server; not opening another browser tab')
+          return
+        }
+      } catch (error) {
+        // Best effort: a callback server that cannot start must not turn the browser flow into a
+        // different failure. The caller that would have owned it reports the reason when it handles
+        // the 401 that sent us here.
+        debugLog('Could not start the OAuth callback server before opening the browser', error)
+      }
+    }
+
+    log(`\nPlease authorize this client by visiting:\n${authorizationUrl.toString()}\n`)
+
+    debugLog('Redirecting to authorization URL', authorizationUrl.toString())
 
     if (await openBrowser(sanitizeUrl(authorizationUrl.toString()))) {
       log('Browser opened automatically.')

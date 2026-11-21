@@ -60,6 +60,20 @@ export interface OAuthProviderOptions {
   protectedResourceMetadata?: ProtectedResourceMetadata
   /** Scope extracted from WWW-Authenticate header */
   wwwAuthenticateScope?: string
+  /**
+   * Binds the OAuth callback server before the browser is sent to an authorization URL, and says
+   * whether this process is the one that should open a tab.
+   *
+   * The SDK opens (or prints) the authorization URL from inside its own 401 handler, so by the time
+   * the caller hears about the refused request the browser is already on its way to the callback
+   * port. A listener that binds afterwards loses the code, and the request that triggered the
+   * sign-in then waits for one that will never arrive (see issue #398). Supplying this hook moves
+   * the bind in front of the redirect.
+   *
+   * Resolves `skipBrowserAuth: true` when another instance owns the sign-in: this process has no
+   * callback server of its own, and must not open a second tab for it.
+   */
+  ensureCallbackServer?: () => Promise<{ skipBrowserAuth: boolean }>
 }
 
 /**
