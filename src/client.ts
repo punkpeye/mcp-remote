@@ -111,6 +111,11 @@ async function runClient(
     authorizationServerMetadata: discoveryResult.authorizationServerMetadata,
     protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
     wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
+    // The browser follows the redirect as soon as it is handed the URL, and the code it carries is
+    // dropped on the floor if nothing is listening yet. The SDK opens that URL from inside its own
+    // 401 handler, before the refusal reaches the caller, so the callback server has to be started
+    // from here. `authInitializer` is declared below; this only runs once a sign-in has begun.
+    ensureCallbackServer: async () => ({ skipBrowserAuth: (await authInitializer()).skipBrowserAuth }),
   })
 
   // Create the client
