@@ -140,6 +140,29 @@ const TOKEN_STORM_WINDOW_MS = 30_000
  */
 const AUTHORIZATION_STORM_LIMIT = 5
 
+/**
+ * How many automatic sign-ins may go unanswered before this client stops opening browser tabs.
+ *
+ * The brake above is sized for a loop that spins: five redirects inside half a minute. A loop paced
+ * by the keep-alive ping runs on a slower clock - one 401 every 30 s - so it never puts two starts
+ * in the same window and the brake never fires, while a tab still opens for every ping (issue #401:
+ * about 1,700 of them over two days).
+ *
+ * The tab is a reminder, not the only way in - the URL is printed for every attempt - so once a few
+ * reminders have gone unanswered another tab adds nothing. The budget is refilled by a sign-in that
+ * completes, which is what makes the tabs answered; see {@link saveTokens}.
+ */
+const UNANSWERED_SIGN_IN_LIMIT = 3
+
+/**
+ * The least time between two automatic sign-ins while an earlier one is still unanswered.
+ *
+ * Only has to be slower than the loop that opened the earlier one; the default keep-alive ping sets
+ * that at 30 s. A couple of minutes also covers how long a person reasonably needs to finish the
+ * sign-in a tab has just brought up.
+ */
+const UNANSWERED_SIGN_IN_GAP_MS = 2 * 60 * 1000
+
 /** Treat a token about to expire as expired, rather than sending one that will 401 in transit. */
 const TOKEN_EXPIRY_MARGIN_MS = 60_000
 
@@ -357,6 +380,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
   private recentTokenWrites: number[] = []
   /** When sign-ins were last started, for spotting a loop that never gets as far as a token. */
   private recentAuthorizations: number[] = []
+  /**
+   * When automatic sign-ins were opened and not yet answered by a completed one, for the
+   * keep-alive-paced loop {@link guardAgainstAuthorizationStorm} cannot see.
+   * See {@link UNANSWERED_SIGN_IN_LIMIT}.
+   */
+  private unansweredSignIns: number[] = []
   /** In-flight proactive refresh, so concurrent requests share one refresh_token use */
   private refreshInFlight: Promise<OAuthTokensWithExpiresAt | undefined> | null = null
   /**
@@ -1494,6 +1523,44 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
   }
 
   /**
+   * Whether this sign-in should open a browser tab, given the ones opened before it and unanswered.
+   *
+   * Tabs are counted rather than sign-ins because a tab is what the user is left with, and the count
+   * only falls back to zero when one is answered by a sign-in that completes. A loop paced slower
+   * than {@link TOKEN_STORM_WINDOW_MS} never trips {@link guardAgainstAuthorizationStorm}, so this is
+   * what stops it from opening a tab per turn (issue #401).
+   */
+  private claimAutomaticSignIn(): boolean {
+    const last = this.unansweredSignIns.at(-1)
+    const now = Date.now()
+
+    if (this.unansweredSignIns.length >= UNANSWERED_SIGN_IN_LIMIT) {
+      log(
+        `Not opening another sign-in tab: ${this.unansweredSignIns.length} automatic sign-ins have gone unanswered since ` +
+          'the last completed one. Open the URL above in a browser to sign in.',
+      )
+      debugLog('Held back an automatic sign-in', { unanswered: this.unansweredSignIns.length })
+      return false
+    }
+
+    if (last !== undefined && now - last < UNANSWERED_SIGN_IN_GAP_MS) {
+      const seconds = Math.round((now - last) / 1000)
+      log(
+        `Not opening another sign-in tab yet: the last one was ${seconds}s ago and is still unanswered. Open the URL ` +
+          'above in a browser to sign in.',
+      )
+      debugLog('Held back an automatic sign-in until the last tab has had a chance', {
+        seconds,
+        gapMs: UNANSWERED_SIGN_IN_GAP_MS,
+      })
+      return false
+    }
+
+    this.unansweredSignIns.push(now)
+    return true
+  }
+
+  /**
    * Takes the stored shape rather than the SDK's `OAuthTokens`, because the SDK hands back
    * whatever {@link tokens} returned when it re-saves - `expires_at` and all. Naming that here
    * is what lets the expiry below be read instead of cast for.
@@ -1539,6 +1606,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
     // Closes the window early, so the next 401 opens a browser instead of joining a flow that has
     // already finished
     this.pendingFlow = null
+
+    // The sign-in completed, so the tabs opened before it have been answered: a later lapse starts
+    // with a fresh budget instead of carrying the last loop's. See {@link UNANSWERED_SIGN_IN_LIMIT}.
+    this.unansweredSignIns = []
   }
 
   /**
@@ -1591,6 +1662,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
     await this.preflightCachedDynamicClientRegistration(authorizationUrl)
 
     this.guardAgainstAuthorizationStorm()
+
+    // A tab per 401 is only a convenience on top of the URL above; once a few have gone unanswered,
+    // a slower loop needs a brake of its own (see {@link UNANSWERED_SIGN_IN_LIMIT}), and the URL is
+    // all that is left to offer.
+    if (!this.claimAutomaticSignIn()) return
 
     if (await openBrowser(sanitizeUrl(authorizationUrl.toString()))) {
       log('Browser opened automatically.')
