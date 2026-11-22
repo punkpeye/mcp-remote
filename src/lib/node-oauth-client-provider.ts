@@ -297,12 +297,16 @@ function withoutScope(init: RequestInit | undefined): RequestInit | undefined {
   return { ...init, body }
 }
 
-/** Whether the authorization server refused a token request as malformed: a 400 `invalid_request`. */
-async function refusedAsInvalidRequest(response: Response): Promise<boolean> {
+/**
+ * Whether the authorization server refused a token request as malformed or for its scope: a 400
+ * `invalid_request` (Salesforce) or `invalid_scope` (DataForSEO).
+ */
+async function refusedAsInvalidRequestOrScope(response: Response): Promise<boolean> {
   if (response.status !== 400) return false
   try {
     const body: unknown = await response.clone().json()
-    return typeof body === 'object' && body !== null && (body as { error?: unknown }).error === OAuthErrorCode.InvalidRequest
+    const error = typeof body === 'object' && body !== null ? (body as { error?: unknown }).error : undefined
+    return error === OAuthErrorCode.InvalidRequest || error === OAuthErrorCode.InvalidScope
   } catch {
     return false
   }
@@ -760,7 +764,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
    *
    * The scope {@link addClientAuthentication} repeats is what Entra needs, but RFC 6749 section 6
    * makes it optional and some servers refuse it outright - Salesforce answers `invalid_request`,
-   * "scope parameter not supported" - which left the session dead at every access-token expiry.
+   * "scope parameter not supported", and DataForSEO answers `invalid_scope` - which left the session
+   * dead at every access-token expiry.
    * Salesforce rejects the scope before it checks the token, so sending the same grant again without
    * it spends nothing. Only once that second request succeeds do later refreshes stop adding the
    * scope; a refusal the retry does not cure (Entra's, say) leaves the behaviour as it was. The
@@ -773,7 +778,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
   private async sendRefresh(fetchFn: FetchLike, url: Parameters<FetchLike>[0], init: RequestInit | undefined): Promise<Response> {
     const response = await fetchFn(url, init)
     const params = tokenRequestParams(init)
-    if (params?.get('grant_type') !== 'refresh_token' || !params.has('scope') || !(await refusedAsInvalidRequest(response))) return response
+    if (params?.get('grant_type') !== 'refresh_token' || !params.has('scope') || !(await refusedAsInvalidRequestOrScope(response)))
+      return response
 
     debugLog('The authorization server refused the scope on the refresh_token grant; sending it again without')
     await response.body?.cancel()

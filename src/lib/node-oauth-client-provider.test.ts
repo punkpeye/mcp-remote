@@ -2185,7 +2185,7 @@ describe('NodeOAuthClientProvider - scope on refresh_token grants (Entra AADSTS9
       expect(endpoint).toHaveBeenCalledTimes(1)
     })
 
-    it('Scenario: a refusal other than invalid_request is passed on as it came', async () => {
+    it('Scenario: a refusal other than invalid_request or invalid_scope is passed on as it came', async () => {
       const provider = new NodeOAuthClientProvider({ ...options, staticOAuthClientMetadata: { scope: 'openid' } as any })
       const endpoint = vi.fn(async () => json(400, { error: 'invalid_grant' }))
 
@@ -2193,6 +2193,48 @@ describe('NodeOAuthClientProvider - scope on refresh_token grants (Entra AADSTS9
 
       expect(response.status).toBe(400)
       await expect(response.json()).resolves.toMatchObject({ error: 'invalid_grant' })
+      expect(endpoint).toHaveBeenCalledTimes(1)
+    })
+
+    // DataForSEO answers any refresh that carries `scope` with invalid_scope (data.dataforseo.com/oauth/token)
+    const dataforseo = () =>
+      vi.fn(async (_url: unknown, init?: RequestInit) =>
+        (init!.body as URLSearchParams).has('scope')
+          ? json(400, { error: 'invalid_scope', error_description: 'The requested scope is invalid, unknown, or malformed' })
+          : json(200, issued),
+      )
+
+    it('Scenario: a refresh refused as invalid_scope is sent again without scope, and later ones leave it off', async () => {
+      const provider = new NodeOAuthClientProvider({ ...options, staticOAuthClientMetadata: { scope: 'api' } as any })
+      const endpoint = dataforseo()
+
+      const response = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({ access_token: 'at-2' })
+      expect(endpoint).toHaveBeenCalledTimes(2)
+      expect(bodyOf(endpoint.mock.calls[0]).get('scope')).toBe('api')
+      expect(bodyOf(endpoint.mock.calls[1]).has('scope')).toBe(false)
+      expect(bodyOf(endpoint.mock.calls[1]).get('refresh_token')).toBe('rt-1')
+
+      endpoint.mockClear()
+      const again = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      expect(again.status).toBe(200)
+      expect(endpoint).toHaveBeenCalledTimes(1)
+      expect(bodyOf(endpoint.mock.calls[0]).has('scope')).toBe(false)
+    })
+
+    it('Scenario: invalid_scope on a refresh that sent no scope is not retried', async () => {
+      const provider = new NodeOAuthClientProvider({
+        ...options,
+        protectedResourceMetadata: { resource: 'https://example.com', scopes_supported: [] } as any,
+      })
+      const endpoint = vi.fn(async () => json(400, { error: 'invalid_scope' }))
+
+      const response = await provider.coordinateTokenRequests(endpoint as any)(tokenEndpoint, await sdkRefresh(provider))
+
+      expect(response.status).toBe(400)
       expect(endpoint).toHaveBeenCalledTimes(1)
     })
   })
