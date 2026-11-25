@@ -206,6 +206,11 @@ const ABANDONED_FLOW_AGE_MS = 10 * 60 * 1000
  */
 const CONCURRENT_FLOW_WINDOW_MS = 10_000
 
+/** The individual scope tokens of a space-delimited `scope` value (RFC 6749 section 3.3). */
+function splitScope(scope: string): string[] {
+  return scope.split(/\s+/).filter(Boolean)
+}
+
 /**
  * The S256 challenge the SDK derives from a verifier.
  *
@@ -729,16 +734,33 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
   }
 
   /**
-   * The scope to repeat on a refresh: what the authorization server actually granted, when it said
-   * so in the token response, and otherwise what this client asked for.
+   * The scope to repeat on a refresh: the scopes that were both asked for and granted, falling back
+   * to whichever of the two is known when they share none.
    *
-   * RFC 6749 section 6 forbids a refresh from naming a scope the resource owner never granted, so
-   * echoing the request back at a server that downscoped the authorization earns `invalid_scope` -
-   * the refresh this exists to fix, broken a different way. The grant is the safe thing to repeat.
+   * Neither side alone is safe to replay. RFC 6749 section 6 forbids a refresh from naming a scope
+   * the resource owner never granted, so echoing the request back at a server that downscoped the
+   * authorization earns `invalid_scope`. But the granted string is not safe either: Microsoft Entra
+   * ID echoes back extra scopes it added itself, notably `<resource>/.default` next to the
+   * resource-specific scopes that were asked for, and then rejects that same string on refresh with
+   * `AADSTS70011` (".default scope can't be combined with resource-specific scopes"), forcing an
+   * interactive sign-in at every access-token expiry (github/copilot-cli#4464). The intersection
+   * drops what was granted but never requested, and keeps any downscoping the server applied.
    */
   private async scopeToRepeatOnRefresh(): Promise<string> {
-    const stored = await readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema)
-    return stored?.scope ?? this.getEffectiveScope()
+    const stored = await this.readStoredTokens()
+    const requested = stored?.requested_scope ?? this.getEffectiveScope()
+    const granted = stored?.scope
+    if (granted === undefined) return requested
+    // Scopes are case-sensitive (RFC 6749 section 3.3), but some servers normalise their case when
+    // echoing them; matching loosely only decides which granted entries survive, as spelled granted.
+    const asked = new Set(splitScope(requested).map((s) => s.toLowerCase()))
+    const kept = splitScope(granted).filter((s) => asked.has(s.toLowerCase()))
+    if (kept.length === 0) return granted
+    const scope = kept.join(' ')
+    if (scope !== granted.trim()) {
+      debugLog('Repeating only the granted scopes that were requested on refresh', { requested, granted, scope })
+    }
+    return scope
   }
 
   /**
