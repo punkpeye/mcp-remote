@@ -77,7 +77,17 @@ export function createLazyAuthCoordinator(
     authState = null
     // Awaited, not fired and forgotten: the port has to be free before anything tries to bind it
     // again, or that bind races this close and can still find the socket being given up.
-    await held?.then(({ server }) => new Promise<void>((resolve) => server.close(() => resolve()))).catch(() => {})
+    // `close` waits for every open connection, and browsers keep spare ones to the callback server
+    // that never carry a request, so without dropping them the close never finishes.
+    await held
+      ?.then(
+        ({ server }) =>
+          new Promise<void>((resolve) => {
+            server.close(() => resolve())
+            server.closeAllConnections()
+          }),
+      )
+      .catch(() => {})
   }
 
   return {
