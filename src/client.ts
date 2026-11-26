@@ -47,6 +47,8 @@ async function runClient(
   tokenEndpoint: string | undefined,
   authorizeResource: string | undefined,
   skipResourceParameter: boolean,
+  skipIssuerMetadataValidation: boolean,
+  authorizationServer: string | undefined,
   authorizeParams: Record<string, string>,
   authTimeoutMs: number,
   serverUrlHash: string,
@@ -75,7 +77,7 @@ async function runClient(
   // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
   // This probes the MCP server for WWW-Authenticate header and fetches PRM
   log('Discovering OAuth server configuration...')
-  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers, tokenEndpoint)
+  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers, tokenEndpoint, authorizationServer)
 
   if (discoveryResult.protectedResourceMetadata) {
     log(`Discovered authorization server: ${discoveryResult.authorizationServerUrl}`)
@@ -106,6 +108,8 @@ async function runClient(
     fetchFn: createFetchWithInit(fetchWithMcpHeaders, { headers }),
     authorizeResource,
     skipResourceParameter,
+    skipIssuerMetadataValidation,
+    authorizationServer,
     authorizeParams,
     serverUrlHash,
     authorizationServerMetadata: discoveryResult.authorizationServerMetadata,
@@ -239,6 +243,8 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
       tokenEndpoint,
       authorizeResource,
       skipResourceParameter,
+      skipIssuerMetadataValidation,
+      authorizationServer,
       authorizeParams,
       authTimeoutMs,
       serverUrlHash,
@@ -262,6 +268,8 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: mcp-remote-client <https://s
         tokenEndpoint,
         authorizeResource,
         skipResourceParameter,
+        skipIssuerMetadataValidation,
+        authorizationServer,
         authorizeParams,
         authTimeoutMs,
         serverUrlHash,
