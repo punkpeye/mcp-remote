@@ -118,6 +118,26 @@ describe('Feature: Giving the callback port back after a sign-in', () => {
     await coordinator.release()
   })
 
+  it('Scenario: A browser socket that never sends a request does not hold the release open', async () => {
+    // Given this instance owns the sign-in, and the browser has opened a spare connection to the
+    // callback server that it never sends a request on
+    const port = await freePort()
+    const coordinator = createLazyAuthCoordinator('release-unused-socket', '/oauth/callback', port, new EventEmitter(), 5000, true)
+    const owned = await coordinator.initializeAuth()
+    const accepted = new Promise<void>((resolve) => owned.server.once('connection', () => resolve()))
+    const spare = net.connect(port, '127.0.0.1')
+    await accepted
+
+    // When its sign-in is done, the release still finishes, so the proxy can start
+    const released = await Promise.race([
+      coordinator.release().then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2000)),
+    ])
+
+    spare.destroy()
+    expect(released).toBe(true)
+  })
+
   it('Scenario: Releasing when nothing is held does nothing', async () => {
     const coordinator = createLazyAuthCoordinator('release-idle', '/oauth/callback', 0, new EventEmitter(), 5000)
     await expect(coordinator.release()).resolves.toBeUndefined()
