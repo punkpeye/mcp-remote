@@ -288,6 +288,30 @@ function withRefreshToken(init: RequestInit | undefined, refreshToken: string): 
   return { ...init, body }
 }
 
+/** The same token request, without its `scope`. */
+function withoutScope(init: RequestInit | undefined): RequestInit | undefined {
+  const params = tokenRequestParams(init)
+  if (!params?.has('scope')) return init
+  const body = new URLSearchParams(params)
+  body.delete('scope')
+  return { ...init, body }
+}
+
+/**
+ * Whether the authorization server refused a token request as malformed or for its scope: a 400
+ * `invalid_request` (Salesforce) or `invalid_scope` (DataForSEO).
+ */
+async function refusedAsInvalidRequestOrScope(response: Response): Promise<boolean> {
+  if (response.status !== 400) return false
+  try {
+    const body: unknown = await response.clone().json()
+    const error = typeof body === 'object' && body !== null ? (body as { error?: unknown }).error : undefined
+    return error === OAuthErrorCode.InvalidRequest || error === OAuthErrorCode.InvalidScope
+  } catch {
+    return false
+  }
+}
+
 /**
  * A token response carrying tokens that are already on disk, for a refresh another instance made.
  *
@@ -701,7 +725,11 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
    * token for itself" and answers `AADSTS90009`, so the session dies at every access-token expiry
    * (modelcontextprotocol/typescript-sdk#2718, anthropics/claude-ai-mcp#840). Repeating the scope
    * the grant carries turns that 400 into a 200, and names nothing the original grant did not, so
-   * every other server accepts it too. Authorization-code exchanges are left exactly as they were.
+   * most servers accept it too. Authorization-code exchanges are left exactly as they were.
+   *
+   * Not every server does: Salesforce answers a refresh that carries `scope` with `invalid_request`
+   * (issue #396). Such a refusal is answered by {@link sendRefresh}, which sends the refresh again
+   * without it and stops this hook from adding the scope from then on.
    *
    * An arrow property rather than a method: the SDK passes `provider.addClientAuthentication`
    * around unbound (see its `auth()`), so `this` has to travel with it.
@@ -717,7 +745,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
       )
       applyClientAuthentication(authMethod, clientInformation, headers, params)
     }
-    if (params.get('grant_type') === 'refresh_token' && !params.has('scope')) {
+    if (params.get('grant_type') === 'refresh_token' && !params.has('scope') && !this.refreshScopeRefused) {
       const scope = await this.scopeToRepeatOnRefresh()
       // A server that advertises `scopes_supported: []` is asking for no scope at all, and `scope=`
       // is malformed rather than empty, so the parameter stays off the request entirely.
@@ -726,6 +754,38 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
         debugLog('Added the requested scope to the refresh_token grant', { scope })
       }
     }
+  }
+
+  /** Set once the authorization server has refused a refresh for carrying `scope`. See {@link sendRefresh}. */
+  private refreshScopeRefused = false
+
+  /**
+   * Sends a token request, and a refresh the server refused for its `scope` once more without it.
+   *
+   * The scope {@link addClientAuthentication} repeats is what Entra needs, but RFC 6749 section 6
+   * makes it optional and some servers refuse it outright - Salesforce answers `invalid_request`,
+   * "scope parameter not supported", and DataForSEO answers `invalid_scope` - which left the session
+   * dead at every access-token expiry.
+   * Salesforce rejects the scope before it checks the token, so sending the same grant again without
+   * it spends nothing. Only once that second request succeeds do later refreshes stop adding the
+   * scope; a refusal the retry does not cure (Entra's, say) leaves the behaviour as it was. The
+   * retry's response is the one returned, so a dead refresh token still surfaces as `invalid_grant`.
+   *
+   * @param fetchFn The fetch to send the request with
+   * @param url The token endpoint
+   * @param init The request. Anything but a `refresh_token` grant that carries `scope` goes out untouched
+   */
+  private async sendRefresh(fetchFn: FetchLike, url: Parameters<FetchLike>[0], init: RequestInit | undefined): Promise<Response> {
+    const response = await fetchFn(url, init)
+    const params = tokenRequestParams(init)
+    if (params?.get('grant_type') !== 'refresh_token' || !params.has('scope') || !(await refusedAsInvalidRequestOrScope(response)))
+      return response
+
+    debugLog('The authorization server refused the scope on the refresh_token grant; sending it again without')
+    await response.body?.cancel()
+    const retry = await fetchFn(url, withoutScope(init))
+    if (retry.ok) this.refreshScopeRefused = true
+    return retry
   }
 
   /**
@@ -1193,6 +1253,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
         refreshToken,
         resource,
         addClientAuthentication: this.addClientAuthentication,
+        fetchFn: (url, init) => this.sendRefresh(fetch, url, init),
       })
 
       // Goes through saveTokens so the new expiry is persisted the same way
@@ -1232,7 +1293,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
   coordinateTokenRequests(fetchFn: FetchLike): FetchLike {
     return async (url, init) => {
       const refreshToken = refreshTokenRedeemedBy(init)
-      if (refreshToken !== undefined) return this.redeemForSdk(refreshToken, (sent) => fetchFn(url, withRefreshToken(init, sent)))
+      if (refreshToken !== undefined)
+        return this.redeemForSdk(refreshToken, (sent) => this.sendRefresh(fetchFn, url, withRefreshToken(init, sent)))
 
       const response = await fetchFn(url, init)
       if (response.status === 401) this.noteRejectedBearer(init)
