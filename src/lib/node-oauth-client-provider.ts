@@ -211,6 +211,11 @@ function splitScope(scope: string): string[] {
   return scope.split(/\s+/).filter(Boolean)
 }
 
+/** Entra ID's `<resource>/.default`, which stands for every permission the app has on that resource. */
+function isDefaultScope(scope: string): boolean {
+  return scope.toLowerCase().endsWith('/.default')
+}
+
 /**
  * The S256 challenge the SDK derives from a verifier.
  *
@@ -734,27 +739,33 @@ export class NodeOAuthClientProvider implements OAuthClientProvider, TokenReques
   }
 
   /**
-   * The scope to repeat on a refresh: the scopes that were both asked for and granted, falling back
-   * to whichever of the two is known when they share none.
+   * The scope to repeat on a refresh: what the authorization server actually granted, when it said
+   * so in the token response, and otherwise what this client asked for.
    *
-   * Neither side alone is safe to replay. RFC 6749 section 6 forbids a refresh from naming a scope
-   * the resource owner never granted, so echoing the request back at a server that downscoped the
-   * authorization earns `invalid_scope`. But the granted string is not safe either: Microsoft Entra
-   * ID echoes back extra scopes it added itself, notably `<resource>/.default` next to the
-   * resource-specific scopes that were asked for, and then rejects that same string on refresh with
-   * `AADSTS70011` (".default scope can't be combined with resource-specific scopes"), forcing an
-   * interactive sign-in at every access-token expiry (github/copilot-cli#4464). The intersection
-   * drops what was granted but never requested, and keeps any downscoping the server applied.
+   * RFC 6749 section 6 forbids a refresh from naming a scope the resource owner never granted, so
+   * echoing the request back at a server that downscoped the authorization earns `invalid_scope`.
+   * The grant is the safe thing to repeat, with one exception. Microsoft Entra ID echoes back a
+   * `<resource>/.default` it added itself next to the resource-specific scopes that were asked for,
+   * and then rejects that same string on refresh with `AADSTS70011` (".default scope can't be
+   * combined with resource-specific scopes"), forcing an interactive sign-in at every access-token
+   * expiry (github/copilot-cli#4464). Only that mix is narrowed, to the scopes that were both asked
+   * for and granted, which keeps any downscoping the server applied.
+   *
+   * Any other grant is repeated as granted. Servers rename what they echo - Google answers `email`
+   * with `https://www.googleapis.com/auth/userinfo.email` - and narrowing such a grant to the
+   * entries that still match the request would refresh to a token missing the rest.
    */
   private async scopeToRepeatOnRefresh(): Promise<string> {
     const stored = await this.readStoredTokens()
     const requested = stored?.requested_scope ?? this.getEffectiveScope()
     const granted = stored?.scope
     if (granted === undefined) return requested
+    const grantedScopes = splitScope(granted)
+    if (!grantedScopes.some(isDefaultScope) || grantedScopes.every(isDefaultScope)) return granted
     // Scopes are case-sensitive (RFC 6749 section 3.3), but some servers normalise their case when
     // echoing them; matching loosely only decides which granted entries survive, as spelled granted.
     const asked = new Set(splitScope(requested).map((s) => s.toLowerCase()))
-    const kept = splitScope(granted).filter((s) => asked.has(s.toLowerCase()))
+    const kept = grantedScopes.filter((s) => asked.has(s.toLowerCase()))
     if (kept.length === 0) return granted
     const scope = kept.join(' ')
     if (scope !== granted.trim()) {

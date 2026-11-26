@@ -2038,6 +2038,26 @@ describe('NodeOAuthClientProvider - scope on refresh_token grants (Entra AADSTS9
     expect(params.get('scope')).toBe('api://app/read api://app/write')
   })
 
+  it('Scenario: a grant with no .default in it is repeated as granted, even where it renames what was asked for', async () => {
+    // Google answers `email` with `https://www.googleapis.com/auth/userinfo.email`. Narrowed to the
+    // entries that still match, the refresh would ask for `openid` alone and get a token without email.
+    withClient(
+      { client_id: 'c1', redirect_uris: [] },
+      {
+        access_token: 'a1',
+        token_type: 'Bearer',
+        scope: 'openid https://www.googleapis.com/auth/userinfo.email',
+        requested_scope: 'openid email',
+      },
+    )
+    const provider = new NodeOAuthClientProvider(options)
+    const params = tokenRequest('refresh_token', { refresh_token: 'r1' })
+
+    await provider.addClientAuthentication(new Headers(), params, 'https://as.example.com/token', undefined)
+
+    expect(params.get('scope')).toBe('openid https://www.googleapis.com/auth/userinfo.email')
+  })
+
   it('Scenario: a server that advertises no scopes gets a refresh with no scope parameter at all', async () => {
     const provider = new NodeOAuthClientProvider({
       ...options,
