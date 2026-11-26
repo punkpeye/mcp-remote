@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { NodeOAuthClientProvider, OAuthTokensWithExpiresAtSchema } from './node-oauth-client-provider'
 import * as mcpAuthConfig from './mcp-auth-config'
 import type { OAuthProviderOptions } from './types'
@@ -2391,6 +2392,99 @@ describe('NodeOAuthClientProvider - a sign-in loop that never reaches a token', 
 
     // Then the next one stops rather than opening another tab
     await expect(authorize()).rejects.toThrow('none of which completed')
+  })
+})
+
+describe('NodeOAuthClientProvider - a sign-in loop paced by keep-alive', () => {
+  const options: OAuthProviderOptions = {
+    serverUrl: 'https://example.com/mcp',
+    callbackPort: 8080,
+    host: 'localhost',
+    serverUrlHash: 'test-hash',
+  }
+  const start = Date.parse('2026-11-22T00:00:00Z')
+
+  const authorize = (provider: NodeOAuthClientProvider) =>
+    provider.redirectToAuthorization(new URL('https://auth.example.com/authorize?client_id=c1'))
+  const at = (provider: NodeOAuthClientProvider, elapsedMs: number) => {
+    vi.setSystemTime(new Date(start + elapsedMs))
+    return authorize(provider)
+  }
+  /** What the browser opener was given, and when, standing in for the tabs that would have opened. */
+  let openedAt: number[]
+  /** A helper that exits cleanly once its exit is watched, so opening counts as a success. */
+  const helperThatOpens = () => {
+    const child = new EventEmitter()
+    child.on('newListener', (added) => {
+      if (added === 'exit') queueMicrotask(() => child.emit('exit', 0))
+    })
+    return child
+  }
+
+  beforeEach(async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(start))
+    vi.mocked(mcpAuthConfig.readJsonFile).mockResolvedValue(undefined as any)
+    vi.mocked(mcpAuthConfig.writeJsonFile).mockResolvedValue(undefined as any)
+    vi.mocked(mcpAuthConfig.deleteConfigFile).mockResolvedValue(undefined as any)
+    vi.mocked(log).mockClear()
+    openedAt = []
+    const { default: open } = await import('open')
+    vi.mocked(open).mockReset()
+    vi.mocked(open).mockImplementation(async () => {
+      openedAt.push(Date.now())
+      return helperThatOpens() as any
+    })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.clearAllMocks()
+  })
+
+  it('Scenario: A 401 every keep-alive interval stops opening tabs, and keeps printing the URL', async () => {
+    // Given a sign-in that nobody completes, asked for by a keep-alive ping every 30 s (issue #401):
+    // the storm brake only ever sees one start in its window, so it never fires on its own
+    const provider = new NodeOAuthClientProvider(options)
+
+    for (let elapsed = 0; elapsed <= 5 * 60_000; elapsed += 30_000) {
+      await at(provider, elapsed)
+    }
+
+    // Then only a few tabs open, minutes apart, instead of one per ping
+    expect(openedAt).toEqual([start, start + 2 * 60_000, start + 4 * 60_000])
+
+    // And the URL is still printed on every attempt, for whoever wants to sign in by hand
+    const printed = vi.mocked(log).mock.calls.filter(([message]) => String(message).includes('Please authorize this client by visiting'))
+    expect(printed).toHaveLength(11)
+    expect(vi.mocked(log).mock.calls.some(([message]) => String(message).includes('Not opening another sign-in tab'))).toBe(true)
+  })
+
+  it('Scenario: A completed sign-in refills the budget for a later lapse', async () => {
+    // Given the reminders for one lapse have all gone unanswered
+    const provider = new NodeOAuthClientProvider(options)
+    await at(provider, 0)
+    await at(provider, 2 * 60_000)
+    await at(provider, 4 * 60_000)
+    await at(provider, 4 * 60_000 + 20_000)
+    expect(openedAt).toHaveLength(3)
+
+    // When the user finishes the sign-in one of those tabs was for
+    vi.setSystemTime(new Date(start + 5 * 60_000))
+    await provider.saveTokens({ access_token: 'fresh', token_type: 'Bearer', expires_in: 3600 })
+
+    // Then the next lapse gets its reminders again
+    await at(provider, 6 * 60_000)
+    await at(provider, 8 * 60_000)
+    expect(openedAt).toHaveLength(5)
+  })
+
+  it('Scenario: A new process still opens the first tab as soon as it is needed', async () => {
+    const provider = new NodeOAuthClientProvider(options)
+
+    await at(provider, 0)
+
+    expect(openedAt).toEqual([start])
   })
 })
 
