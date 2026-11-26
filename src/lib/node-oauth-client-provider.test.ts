@@ -371,6 +371,66 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     })
   })
 
+  describe('callback server before the browser', () => {
+    const authUrl = () => new URL('https://auth.example.com/authorize')
+    const browser = async () => (await import('open')).default
+
+    it('binds the callback server before the browser is sent to the authorization URL', async () => {
+      // Given a sign-in that has to be listening for its code before the browser follows the redirect
+      const order: string[] = []
+      const ensureCallbackServer = vi.fn(async () => {
+        order.push('listen')
+        return { skipBrowserAuth: false }
+      })
+      const open = await browser()
+      vi.mocked(open).mockImplementation(async () => {
+        order.push('browser')
+        return {} as never
+      })
+      provider = new NodeOAuthClientProvider({ ...defaultOptions, ensureCallbackServer })
+
+      // When the SDK opens the sign-in from inside its 401 handling
+      await provider.redirectToAuthorization(authUrl())
+
+      // Then the listener is already up by the time the browser gets the URL - the code would
+      // otherwise be redirected at a port nothing is bound to and dropped
+      expect(order).toEqual(['listen', 'browser'])
+    })
+
+    it('does not open a tab when another instance owns the sign-in', async () => {
+      // Given a sibling instance already running the browser flow for this server
+      const ensureCallbackServer = vi.fn(async () => ({ skipBrowserAuth: true }))
+      const open = await browser()
+      vi.mocked(open).mockClear()
+      provider = new NodeOAuthClientProvider({ ...defaultOptions, ensureCallbackServer })
+
+      // When this instance is asked to redirect as well
+      await provider.redirectToAuthorization(authUrl())
+
+      // Then there is no second tab: this instance cannot receive the code anyway
+      expect(ensureCallbackServer).toHaveBeenCalledTimes(1)
+      expect(open).not.toHaveBeenCalled()
+    })
+
+    it('still opens the browser when the callback server cannot start', async () => {
+      // Given a listener that fails to bind, e.g. a pinned port held by an unrelated process
+      const ensureCallbackServer = vi.fn(async () => {
+        throw new Error('listen EADDRINUSE')
+      })
+      const open = await browser()
+      vi.mocked(open).mockClear()
+      vi.mocked(open).mockResolvedValue({} as never)
+      provider = new NodeOAuthClientProvider({ ...defaultOptions, ensureCallbackServer })
+
+      // When the redirect is attempted
+      await expect(provider.redirectToAuthorization(authUrl())).resolves.toBeUndefined()
+
+      // Then the sign-in is not made worse: the browser still opens, and the caller that handles
+      // the 401 reports why the listener is missing
+      expect(open).toHaveBeenCalledTimes(1)
+    })
+  })
+
   describe('scope from a live WWW-Authenticate challenge', () => {
     it('should keep the scopes a 403 insufficient_scope asked for', async () => {
       // Given a resource advertising only "read", and a call that turned out to need more

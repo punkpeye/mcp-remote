@@ -16,6 +16,7 @@ const mocked = vi.hoisted(() => {
     createLazyAuthCoordinator,
     remoteTransport: { finishAuth } as { finishAuth?: typeof finishAuth },
     reauthorize: undefined as (() => Promise<void>) | undefined,
+    providerOptions: undefined as { ensureCallbackServer?: () => Promise<{ skipBrowserAuth: boolean }> } | undefined,
   }
 })
 
@@ -28,6 +29,9 @@ vi.mock('@modelcontextprotocol/server/stdio', () => ({
 vi.mock('./lib/node-oauth-client-provider', () => ({
   NodeOAuthClientProvider: class {
     useAuthorizationState = mocked.useAuthorizationState
+    constructor(options: unknown) {
+      mocked.providerOptions = options as typeof mocked.providerOptions
+    }
   },
 }))
 vi.mock('./lib/coordination', () => ({
@@ -150,5 +154,24 @@ describe('proxy OAuth browser completion', () => {
     mocked.initializeAuth.mockResolvedValue({ actualPort: 3600, server: {}, skipBrowserAuth: true, waitForAuthCode: vi.fn() })
     await mocked.reauthorize!()
     expect(mocked.release).toHaveBeenCalledTimes(2)
+  })
+
+  it('starts the callback listener before the browser is opened (issue #398)', async () => {
+    // Given a proxy that has not bound a callback port yet
+    mocked.initializeAuth.mockClear()
+
+    // When the SDK asks the provider to open a browser sign-in from inside its 401 handling
+    const verdict = await mocked.providerOptions!.ensureCallbackServer!()
+
+    // Then the listener that receives the code is already bound, and the coordination verdict
+    // travels back so a follower does not open a second tab
+    expect(mocked.initializeAuth).toHaveBeenCalledTimes(1)
+    expect(verdict).toEqual({ skipBrowserAuth: false })
+  })
+
+  it('tells the provider to keep the tab shut when a sibling owns the sign-in', async () => {
+    mocked.initializeAuth.mockResolvedValue({ actualPort: 3600, server: {}, skipBrowserAuth: true, waitForAuthCode: vi.fn() })
+
+    await expect(mocked.providerOptions!.ensureCallbackServer!()).resolves.toEqual({ skipBrowserAuth: true })
   })
 })
