@@ -1712,7 +1712,9 @@ export function mcpProxy({
     }
 
     try {
-      await transportToServer.send(outgoing)
+      // The answer travels on the stream this request's POST opens. If that stream ends without it,
+      // closed by the server or cut off with nothing to resume from, nothing else will answer it
+      await transportToServer.send(outgoing, awaitsAnswer ? { onRequestStreamEnd: () => failUnansweredRequest(message) } : undefined)
       if (message.method === 'initialize') scheduleInitializeTimeout(message)
       return
     } catch (error) {
@@ -1792,6 +1794,24 @@ export function mcpProxy({
       log(`Remote server did not answer 'initialize' within ${seconds}s`)
       replyWithError(message, new Error(`timed out after ${seconds}s waiting for the remote server to answer 'initialize'`))
     }, INITIALIZE_TIMEOUT_MS).unref?.()
+  }
+
+  /**
+   * Fails a request whose response stream ended without its answer.
+   *
+   * The SDK reports the end of every request's stream, answered or not. A stream that breaks only
+   * reaches `onerror`, which logs it, so without this the client waits forever on the request.
+   */
+  function failUnansweredRequest(message: Message) {
+    // Answered on that stream: delivery has already taken it off the books
+    if (!pendingRequests.has(message.id)) return
+    // Asked for more input instead: the exchange answers the client once its own requests finish
+    if (liveExchanges.has(message.id)) return
+    pendingRequests.delete(message.id)
+    modernOriginals.delete(message.id)
+    modernRetryIds.delete(message.id)
+    log(`The remote server's response stream for '${message.method}' ended without an answer`)
+    replyWithError(message, new Error('the response stream ended before the remote server answered this request'))
   }
 
   /**

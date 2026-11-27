@@ -1485,6 +1485,8 @@ describe('Feature: MCP Proxy', () => {
           }),
         }),
       }),
+      // Watching the stream that will carry the answer, so it can fail the request if that ends first
+      expect.objectContaining({ onRequestStreamEnd: expect.any(Function) }),
     )
   })
 
