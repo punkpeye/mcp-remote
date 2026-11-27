@@ -646,9 +646,10 @@ export function mcpProxy({
    * Client requests that have gone to the server and are still waiting on an answer.
    *
    * Recorded at the point of sending rather than of receiving, so a request still queued behind a
-   * reconnect is not counted as one the vanished session owes an answer for.
+   * reconnect is not counted as one the vanished session owes an answer for. Keyed by id and holding
+   * the request itself, so whatever settles one can tell it from a later request reusing the id.
    */
-  const pendingRequests = new Set<string | number>()
+  const pendingRequests = new Map<string | number, Message>()
 
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
@@ -742,6 +743,10 @@ export function mcpProxy({
     }
 
     log('[Local→Remote]', message.method || message.id)
+
+    // The client stops waiting on a request when it cancels it, and the server is not meant to answer
+    // it, so nothing owes the client an answer for it any more
+    if (message.method === 'notifications/cancelled') pendingRequests.delete(message.params?.requestId)
 
     debugLog('Local → Remote message', {
       method: message.method,
@@ -1693,7 +1698,7 @@ export function mcpProxy({
     }
 
     const awaitsAnswer = message.method !== undefined && message.id !== undefined && message.id !== null
-    if (awaitsAnswer) pendingRequests.add(message.id!)
+    if (awaitsAnswer) pendingRequests.set(message.id!, message)
 
     // Stamped here rather than in the transformer because the transformer runs the moment the
     // client's message arrives, which can be before the probe has said which era to speak.
@@ -1711,10 +1716,12 @@ export function mcpProxy({
       modernOriginals.set(message.id!, message)
     }
 
+    // The answer travels on the stream this request's POST opens. If that stream ends without it,
+    // closed by the server or cut off with nothing to resume from, nothing else will answer it
+    const sendOptions = awaitsAnswer ? { onRequestStreamEnd: () => failUnansweredRequest(message) } : undefined
+
     try {
-      // The answer travels on the stream this request's POST opens. If that stream ends without it,
-      // closed by the server or cut off with nothing to resume from, nothing else will answer it
-      await transportToServer.send(outgoing, awaitsAnswer ? { onRequestStreamEnd: () => failUnansweredRequest(message) } : undefined)
+      await transportToServer.send(outgoing, sendOptions)
       if (message.method === 'initialize') scheduleInitializeTimeout(message)
       return
     } catch (error) {
@@ -1772,8 +1779,11 @@ export function mcpProxy({
 
       try {
         await reinitializeSession()
-        await transportToServer.send(message)
+        // Back on the books for the retry, whose stream can end without an answer like the first one
+        if (awaitsAnswer) pendingRequests.set(message.id!, message)
+        await transportToServer.send(message, sendOptions)
       } catch (retryError) {
+        if (awaitsAnswer) pendingRequests.delete(message.id!)
         onServerError(retryError as Error)
         replyWithError(message, retryError as Error)
       }
@@ -1799,18 +1809,18 @@ export function mcpProxy({
   /**
    * Fails a request whose response stream ended without its answer.
    *
-   * The SDK reports the end of every request's stream, answered or not. A stream that breaks only
-   * reaches `onerror`, which logs it, so without this the client waits forever on the request.
+   * The SDK reports the end of a request's SSE stream whether or not the answer came on it. A stream
+   * that breaks only reaches `onerror`, which logs it, so without this the client waits forever on
+   * the request.
    */
   function failUnansweredRequest(message: Message) {
-    // Answered on that stream: delivery has already taken it off the books
-    if (!pendingRequests.has(message.id)) return
+    // Already settled - answered, cancelled, or timed out - or its id now belongs to a later request
+    if (pendingRequests.get(message.id) !== message) return
     // Asked for more input instead: the exchange answers the client once its own requests finish
     if (liveExchanges.has(message.id)) return
     pendingRequests.delete(message.id)
     modernOriginals.delete(message.id)
-    modernRetryIds.delete(message.id)
-    log(`The remote server's response stream for '${message.method}' ended without an answer`)
+    log(`The remote server's response stream for '${message.method}' (${message.id}) ended without an answer`)
     replyWithError(message, new Error('the response stream ended before the remote server answered this request'))
   }
 
@@ -1824,8 +1834,8 @@ export function mcpProxy({
   function failPendingRequests(reason: string) {
     if (pendingRequests.size === 0) return
 
-    debugLog('Failing requests the dropped session can no longer answer', { ids: [...pendingRequests] })
-    for (const id of pendingRequests) {
+    debugLog('Failing requests the dropped session can no longer answer', { ids: [...pendingRequests.keys()] })
+    for (const id of pendingRequests.keys()) {
       messageTransformer.release(id)
       transportToClient.send({ jsonrpc: '2.0', id, error: { code: -32001, message: `mcp-remote: ${reason}` } }).catch(onClientError)
       // Answered now, so there is nothing left to retry a multi-round-trip exchange for

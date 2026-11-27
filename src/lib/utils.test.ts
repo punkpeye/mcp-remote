@@ -3425,6 +3425,48 @@ describe('Feature: Bridging the modern surfaces a 2025-era client has never hear
     expect(clientSent.find((message) => message.id === 'call-1').result).toEqual({ content: [{ type: 'text', text: 'done' }] })
   })
 
+  it('Scenario: The end of the stream that asked for more input does not fail the request', async () => {
+    // Given a server that answers tools/call by asking for sampling first, and ends each request's
+    // stream once it has answered, as a streamable HTTP server does
+    const clientSent: any[] = []
+    const serverSent: any[] = []
+    const transportToClient = clientTransport(clientSent)
+    const transportToServer = serverTransport(serverSent, (message: any) => {
+      if (message.method === 'server/discover') return { jsonrpc: '2.0', id: message.id, result: discoverResult({ tools: {} }) }
+      if (message.method !== 'tools/call') return undefined
+      if (message.params.inputResponses) {
+        return { jsonrpc: '2.0', id: message.id, result: { resultType: 'complete', content: [{ type: 'text', text: 'done' }] } }
+      }
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resultType: 'input_required', inputRequests: { ask: { method: 'sampling/createMessage', params: { messages: [] } } } },
+      }
+    })
+    const send = transportToServer.send
+    transportToServer.send = vi.fn(async (message: any, options?: { onRequestStreamEnd?: () => void }) => {
+      await send(message)
+      // Queued behind the answer, the order the SDK reports them in
+      queueMicrotask(() => options?.onRequestStreamEnd?.())
+    })
+    mcpProxy({ transportToClient, transportToServer, ignoredTools: [], protocolMode: 'auto' })
+
+    transportToClient.onmessage?.(INITIALIZE as any)
+    await vi.waitFor(() => expect(clientSent).toHaveLength(1))
+
+    // When the client calls the tool, and the stream that carried the question ends
+    transportToClient.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: 'call-1', params: { name: 'search' } } as any)
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.method === 'sampling/createMessage')).toHaveLength(1))
+    const question = clientSent.find((message) => message.method === 'sampling/createMessage')
+    transportToClient.onmessage?.({ jsonrpc: '2.0', id: question.id, result: { role: 'assistant', content: { type: 'text', text: 'hi' } } })
+
+    // Then the client is answered once, with the result of the exchange rather than an error
+    await vi.waitFor(() => expect(clientSent.filter((message) => message.id === 'call-1' && message.result)).toHaveLength(1))
+    expect(clientSent.filter((message) => message.id === 'call-1')).toEqual([
+      expect.objectContaining({ result: { content: [{ type: 'text', text: 'done' }] } }),
+    ])
+  })
+
   it('Scenario: Reopen a change-notification stream the server closed, so the client keeps hearing', async () => {
     // A stream is not a session: it ends on a restart or an idle timeout, and nothing below this
     // notices it stopped - the client simply stops being told anything ever changed
